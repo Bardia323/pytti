@@ -251,7 +251,7 @@ class PixelImage(DifferentiableImage):
         self.value.copy_(self.value.clamp(0, 1))
         self.tensor.copy_(self.tensor.clamp(0, float('inf')))
 
-    def encode_image(self, pil_image, smart_encode=True, device=DEVICE):
+    def encode_image_old(self, pil_image, smart_encode=True, device=DEVICE):
         width, height = self.image_shape
 
         scale = self.scale
@@ -273,6 +273,81 @@ class PixelImage(DifferentiableImage):
             guide.run_steps(100, [], [], [mse])  # Reduced from 201 to 100 steps
             if self.hdr_loss is not None:
                 self.hdr_loss.set_weight(before_weight)
+
+    def encode_image(self, pil_image, smart_encode=True, device=DEVICE):
+      width, height = self.image_shape
+
+      scale = self.scale
+      color_ref = pil_image.resize((width // scale, height // scale), Image.LANCZOS)
+      color_ref = TF.to_tensor(color_ref).to(device)
+
+      # All operations below are done without tracking gradients
+      with torch.no_grad():
+          # Step 1: Compute grayscale values (self.value)
+          magic_color = torch.tensor([0.299, 0.587, 0.114], device=device).view(3, 1, 1)
+          value_ref = (color_ref * magic_color).sum(dim=0)
+          self.value.copy_(value_ref)
+
+          # Step 2: Quantize self.value into pallet_size levels
+          pallet_size = self.pallet_size
+          n_pallets = self.n_pallets
+          value_quantized = ((self.value / self.value.max()) * (pallet_size - 1)).long()
+          value_quantized = value_quantized.clamp(0, pallet_size - 1)
+
+          # Step 3: Compute normalized colors
+          epsilon = 1e-6
+          normalized_color = color_ref / (self.value.unsqueeze(0) + epsilon)
+
+          # Prepare data for clustering
+          normalized_color = normalized_color.permute(1, 2, 0).contiguous()  # H x W x 3
+          normalized_color = normalized_color.view(-1, 3)
+          value_quantized_flat = value_quantized.view(-1)
+
+          # Initialize new tensors for self.pallet and self.tensor
+          new_pallet = torch.zeros_like(self.pallet)
+          new_tensor = torch.zeros_like(self.tensor)
+
+          # Step 4: Cluster colors per brightness level
+          from sklearn.cluster import KMeans
+          for i in range(pallet_size):
+              mask = (value_quantized_flat == i)
+              if mask.sum() == 0:
+                  continue  # Skip if no pixels at this brightness level
+
+              colors = normalized_color[mask]
+
+              # Perform K-means clustering
+              n_clusters = min(n_pallets, colors.shape[0])  # Ensure n_clusters does not exceed number of samples
+              if n_clusters == 0:
+                  continue  # Skip if no colors to cluster
+              kmeans = KMeans(n_clusters=n_clusters, n_init=1, max_iter=10, random_state=0)
+              labels = kmeans.fit_predict(colors.cpu().numpy())
+              cluster_centers = torch.tensor(kmeans.cluster_centers_, device=device)
+
+              # Step 5: Set new_pallet
+              brightness_value = (i / (pallet_size - 1))
+              new_pallet[i, :n_clusters, :] = cluster_centers * brightness_value
+              if n_clusters < n_pallets:
+                  # Fill remaining pallets with the last cluster center
+                  new_pallet[i, n_clusters:, :] = cluster_centers[-1] * brightness_value
+
+              # Step 6: Assign new_tensor
+              indices = torch.nonzero(mask).squeeze()
+              labels = torch.tensor(labels, device=device)
+              h = self.value.shape[0]
+              w = self.value.shape[1]
+              k_indices = labels.long()
+              y_indices = (indices // w).long()
+              x_indices = (indices % w).long()
+              new_tensor[k_indices, y_indices, x_indices] = 1
+
+          # Normalize new_tensor
+          new_tensor = new_tensor.clamp(0, 1)
+
+          # Assign new tensors to self.pallet and self.tensor
+          self.pallet.copy_(new_pallet)
+          self.tensor.copy_(new_tensor)
+
 
     @torch.no_grad()
     def encode_random(self, random_pallet=False):
