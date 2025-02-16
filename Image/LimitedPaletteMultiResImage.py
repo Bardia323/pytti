@@ -224,6 +224,9 @@ class LimitedPaletteMultiResImage(DifferentiableImage):
         """
         self.use_palette_target = lock
 
+    def lock_pallet(self, lock=True):
+        self.lock_palette(lock)
+        
     def sort_palette(self):
         """
         Returns the palette sorted by brightness.
