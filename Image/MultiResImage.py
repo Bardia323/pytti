@@ -12,8 +12,9 @@ from pytti.Image import DifferentiableImage
 class MultiResImage(DifferentiableImage):
     """
     Multi-resolution direct ascent approach for image representation.
-    This follows the idea of summing multiple scales of learned parameters,
-    as described in the 'Direct Ascent Synthesis' paper.
+    This class stores learnable residuals at several downscaled resolutions.
+    In decoding, each residual is upsampled to the final output size, summed,
+    passed through a tanh, and then mapped to [0, 1].
     """
     def __init__(self,
                  width,
@@ -23,109 +24,90 @@ class MultiResImage(DifferentiableImage):
                  init='random',
                  device=DEVICE):
         """
-        width, height    : final output resolution
-        pixel_format     : PIL image mode, e.g. 'RGB', 'L', etc.
-        scales           : list or tuple of integer downscale factors
-        init             : how to initialize the parameters ('random' or 'zeros')
-        device           : which torch device to use
+        width, height: Final output resolution (in pixels).
+        pixel_format : PIL image mode (e.g., 'RGB', 'L', etc.).
+        scales       : A tuple of downscale factors for multi-resolution components.
+        init         : Initialization mode ('random' or 'zeros').
+        device       : Torch device to use.
         """
         super().__init__(width, height, pixel_format)
         self.scales = scales
-        
-        # Create one Parameter for each scale
-        # Each is shape (3, H//scale, W//scale) if RGB, or shape (1, H//scale, W//scale) if L
-        # We'll store them in an nn.ModuleList or nn.ParameterList:
-        self.residuals = nn.ParameterList()
-        
         n_channels = 3 if pixel_format == 'RGB' else 1
         
+        # Create a learnable parameter for each scale.
+        self.residuals = nn.ParameterList()
         for s in scales:
-            # scaled-down size
             h_down = max(1, height // s)
             w_down = max(1, width  // s)
-            
             if init == 'random':
-                data = torch.rand(n_channels, h_down, w_down, device=device)
+                # More varied noise: Uniform over [-1, 1]
+                data = 2 * torch.rand(n_channels, h_down, w_down, device=device) - 1
             else:
                 data = torch.zeros(n_channels, h_down, w_down, device=device)
-            
-            # we wrap the data in an nn.Parameter so it’s learnable
-            param = nn.Parameter(data)
-            self.residuals.append(param)
+            self.residuals.append(nn.Parameter(data))
         
         self.output_axes = ('n', 's', 'y', 'x')
-        # you can adjust the default learning rate if you like
         self.lr = 0.1
 
     def decode_tensor(self):
         """
-        Sums all learned multi-resolution components (upsampled to the
-        final size) and clamps the result to [0,1].
+        Upsamples each scale to the final resolution, sums them,
+        applies tanh, and maps the result from [-1, 1] to [0, 1].
+        The final output tensor has shape [1, C, height, width],
+        with height and width exactly matching the ones provided.
         """
-        # Start with zeros at the final resolution
-        pixel_format = self.pixel_format
-        n_channels = 3 if pixel_format == 'RGB' else 1
+        # self.image_shape is (width, height)
+        width, height = self.image_shape
+        n_channels = 3 if self.pixel_format == 'RGB' else 1
+        device = self.residuals[0].device
         
-        # We'll accumulate in a single tensor
-        accum = torch.zeros(1, n_channels, self.image_shape[1], self.image_shape[0],
-                            device=self.residuals[0].device)
-        
+        # Create an accumulator tensor with shape [1, C, height, width]
+        accum = torch.zeros(1, n_channels, height, width, device=device)
         for scale, param in zip(self.scales, self.residuals):
-            # param is shape [C, h_down, w_down]
-            # upsample to final size
+            # Upsample each parameter tensor to (height, width)
             up = F.interpolate(
-                param.unsqueeze(0),  # add batch dim
-                size=(self.image_shape[1], self.image_shape[0]),
-                mode='bilinear',  # or 'nearest' if you want chunkier style
+                param.unsqueeze(0),
+                size=(height, width),
+                mode='bilinear',
                 align_corners=True
             )
             accum = accum + up
-        
-        # Optionally apply something like (tanh(...) + 1)/2 if you prefer
-        # for now, we just clamp
-        image = clamp_with_grad(accum, 0, 1)
-        return image  # shape [1, C, H, W]
+        # Apply tanh and transform to [0, 1]
+        image = (torch.tanh(accum) + 1) / 2
+        return clamp_with_grad(image, 0, 1)
 
     @torch.no_grad()
     def encode_image(self, pil_image):
         """
-        Optional method for directly initializing
-        the multi-resolution parameters from an existing image.
-        A trivial approach: just downsample the given image for each scale
-        and store in self.residuals.
+        Initializes each scale's parameters by downsampling the given image.
+        The image is converted to the desired pixel_format, then each scale
+        is computed and mapped from [0, 1] to [-1, 1] to match the internal range.
         """
         pil_image = pil_image.convert(self.pixel_format)
-        
-        # convert to tensor, shape [C, H, W]
         full_tensor = TF.to_tensor(pil_image).to(self.residuals[0].device)
-        
+        width, height = self.image_shape
         for scale, param in zip(self.scales, self.residuals):
-            h_down = param.shape[1]
-            w_down = param.shape[2]
-            
-            # downsample the original image
+            h_down, w_down = param.shape[1], param.shape[2]
             down = F.interpolate(
                 full_tensor.unsqueeze(0),
                 size=(h_down, w_down),
                 mode='bilinear',
                 align_corners=True
             )
-            # Because each scale in this approach is effectively a residual,
-            # you can either set it directly or treat it as an offset from zero
-            self.residuals[self.scales.index(scale)].copy_(down[0])
+            # Map from [0,1] to [-1,1]
+            self.residuals[self.scales.index(scale)].copy_(down[0] * 2 - 1)
 
     @torch.no_grad()
     def encode_random(self):
         """
-        Overwrite each scale with random noise in [0,1].
+        Overwrites each scale with random noise uniformly drawn from [-1, 1].
         """
-        for i, param in enumerate(self.residuals):
-            param.uniform_(0,1)
+        for param in self.residuals:
+            param.uniform_(-1, 1)
 
     def update(self):
         """
-        Hook called during training steps for clamping, etc.
-        Here we can clamp each param in [0,1] if you like, or do nothing.
+        Optional hook called during training to clamp parameters to the range [-1, 1].
         """
         for param in self.residuals:
-            param.data.clamp_(0, 1)
+            param.data.clamp_(-1, 1)
