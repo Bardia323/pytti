@@ -40,7 +40,7 @@ class MultiResImage(DifferentiableImage):
             h_down = max(1, height // s)
             w_down = max(1, width  // s)
             if init == 'random':
-                # More varied noise: Uniform over [-1, 1]
+                # Uniform noise in [-1, 1]
                 data = 2 * torch.rand(n_channels, h_down, w_down, device=device) - 1
             else:
                 data = torch.zeros(n_channels, h_down, w_down, device=device)
@@ -61,7 +61,7 @@ class MultiResImage(DifferentiableImage):
         n_channels = 3 if self.pixel_format == 'RGB' else 1
         device = self.residuals[0].device
         
-        # Create an accumulator tensor with shape [1, C, height, width]
+        # Accumulator with shape [1, C, height, width]
         accum = torch.zeros(1, n_channels, height, width, device=device)
         for scale, param in zip(self.scales, self.residuals):
             # Upsample each parameter tensor to (height, width)
@@ -72,17 +72,17 @@ class MultiResImage(DifferentiableImage):
                 align_corners=True
             )
             accum = accum + up
-        # Apply tanh and transform to [0, 1]
+        # Apply tanh then map from [-1,1] to [0,1]
         image = (torch.tanh(accum) + 1) / 2
         return clamp_with_grad(image, 0, 1)
 
     def get_image_tensor(self):
         """
-        Returns the decoded tensor directly.
-        This avoids using a PIL conversion and ensures that the image tensor
-        has the expected dimensions (matching self.image_shape).
+        Returns the decoded tensor with shape [C, height, width].
+        This ensures downstream transforms (like zoom_3d) receive the expected dimensions.
         """
-        return self.decode_tensor()
+        # Squeeze out the batch dimension.
+        return self.decode_tensor().squeeze(0)
 
     @torch.no_grad()
     def encode_image(self, pil_image):
