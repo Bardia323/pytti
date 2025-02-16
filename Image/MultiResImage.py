@@ -88,8 +88,9 @@ class MultiResImage(DifferentiableImage):
         Sets the internal multi-resolution parameters so that decoding yields the provided tensor.
         Expects `tensor` to have shape [C, H, W] in the [0, 1] range.
         We invert the tanh mapping:
-            output = (tanh(sum) + 1)/2   =>   sum = atanh(2*output - 1)
-        and then distribute the pre-activation value evenly among the scales.
+            output = (tanh(sum) + 1)/2   =>   sum = atanh(2*output-1)
+        Since atanh(2*output-1) = 0.5*log( output/(1-output) ),
+        we distribute the pre-activation value evenly among the scales.
         """
         # Ensure tensor is in the proper shape and range
         if tensor.ndim != 3:
@@ -97,7 +98,8 @@ class MultiResImage(DifferentiableImage):
         eps = 1e-5
         tensor = tensor.clamp(eps, 1 - eps)
         # Invert mapping: compute pre-activation values
-        pre = 0.5 * torch.log((2 * tensor) / (1 - tensor))  # atanh(2*output-1)
+        # Correct inversion: pre = atanh(2*output-1) = 0.5 * log(output/(1-output))
+        pre = 0.5 * torch.log(tensor / (1 - tensor))
         # Distribute pre-activation evenly among scales
         N = len(self.scales)
         for i, s in enumerate(self.scales):
@@ -105,7 +107,6 @@ class MultiResImage(DifferentiableImage):
             h_down = self.residuals[i].shape[1]
             w_down = self.residuals[i].shape[2]
             down = F.interpolate(pre.unsqueeze(0), size=(h_down, w_down), mode='bilinear', align_corners=True)
-            # Set the parameter for this scale as pre / N
             self.residuals[i].data.copy_(down.squeeze(0) / N)
 
     @torch.no_grad()
