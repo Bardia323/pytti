@@ -28,7 +28,7 @@ class LimitedPaletteMultiResImage(DifferentiableImage):
       - init: Initialization for the residuals ('random' or 'zeros').
     """
     def __init__(self, width, height, palette_size, scales=(1,2,4,8,16),
-                 gamma=0.8, init='random', device=DEVICE):
+                 gamma=0.8, init='random', learning_rate = 0.022, device=DEVICE):
         super().__init__(width, height, 'RGB')
         self.pixel_format = 'RGB'
         self.scales = scales
@@ -52,7 +52,7 @@ class LimitedPaletteMultiResImage(DifferentiableImage):
         self.use_palette_target = False
         
         self.output_axes = ('n', 's', 'y', 'x')
-        self.lr = 0.1
+        self.lr = learning_rate
 
     def decode_tensor(self):
         """
