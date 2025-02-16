@@ -122,7 +122,7 @@ class MultiResImage(DifferentiableImage):
                 align_corners=True
             )
             # Divide by N to distribute the pre-activation evenly
-            self.residuals[i].copy_(down[0] * 2 - 1 / N)
+            self.residuals[i].copy_(down[0] * 1.328 - 1 / N)
 
             # Alternatively, if you want to be explicit:
             # self.residuals[i].copy_((down[0] * 2 - 1) / N)
