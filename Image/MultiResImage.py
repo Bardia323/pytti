@@ -31,7 +31,7 @@ class MultiResImage(DifferentiableImage):
         device       : Torch device to use.
         """
         super().__init__(width, height, pixel_format)
-        # Override the pixel_format (in case the base class set it incorrectly)
+        # Make sure we have a proper pixel_format string
         self.pixel_format = pixel_format
         self.scales = scales
         n_channels = 3 if pixel_format == 'RGB' else 1
@@ -105,11 +105,14 @@ class MultiResImage(DifferentiableImage):
     def encode_image(self, pil_image, smart_encode=True, device=DEVICE):
         """
         Initializes each scale's parameters by downsampling the given image.
+        The image is converted to the desired pixel_format, then each scale
+        is computed and mapped from [0, 1] to [-1, 1] to match the internal range.
         The 'smart_encode' parameter is accepted for compatibility.
         """
         pil_image = pil_image.convert(self.pixel_format)
         full_tensor = TF.to_tensor(pil_image).to(device)
         width, height = self.image_shape
+        N = len(self.scales)
         for i, s in enumerate(self.scales):
             h_down, w_down = self.residuals[i].shape[1], self.residuals[i].shape[2]
             down = F.interpolate(
@@ -118,7 +121,11 @@ class MultiResImage(DifferentiableImage):
                 mode='bilinear',
                 align_corners=True
             )
-            self.residuals[i].copy_(down[0] * 2 - 1)
+            # Divide by N to distribute the pre-activation evenly
+            self.residuals[i].copy_(down[0] * 2 - 1 / N)
+
+            # Alternatively, if you want to be explicit:
+            # self.residuals[i].copy_((down[0] * 2 - 1) / N)
 
     @torch.no_grad()
     def encode_random(self):
