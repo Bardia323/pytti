@@ -47,7 +47,7 @@ class MultiResImage(DifferentiableImage):
             self.residuals.append(nn.Parameter(data))
         
         self.output_axes = ('n', 's', 'y', 'x')
-        self.lr = 0.1
+        self.lr = 0.218
 
     def decode_tensor(self):
         """
