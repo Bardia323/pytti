@@ -13,26 +13,26 @@ class LimitedPaletteMultiResImage(DifferentiableImage):
     """
     Limited Palette Multi-resolution Image.
     
-    This model represents an image with a multi-resolution decomposition 
-    (learnable residuals at several scales) and then applies a limited palette
-    quantization step. The continuous output (after summing residuals and applying tanh)
-    is mapped to discrete colors by computing soft assignments over a learned palette.
+    This model represents an image using a multi-resolution decomposition
+    (learnable residuals at several scales) and then applies limited palette
+    quantization. The continuous image (computed from the residuals via tanh)
+    is converted to a discrete image by computing its luminance and then quantizing
+    that luminance into indices into a sorted palette. Linear interpolation between
+    adjacent palette entries is used to produce the final output.
     
     Parameters:
       - width, height: Final output resolution.
       - palette_size: Number of palette entries.
-      - scales: Tuple of downscale factors used for the multi-resolution decomposition.
-      - gamma: Gamma correction to apply when encoding an image.
-      - temperature: Temperature for softmax quantization.
+      - scales: Tuple of downscale factors for the multi-resolution decomposition.
+      - gamma: Gamma correction to apply during encoding.
       - init: Initialization for the residuals ('random' or 'zeros').
     """
     def __init__(self, width, height, palette_size, scales=(1,2,4,8,16),
-                 gamma=0.8, temperature=0.5, init='random', device=DEVICE):
+                 gamma=0.8, init='random', device=DEVICE):
         super().__init__(width, height, 'RGB')
         self.pixel_format = 'RGB'
         self.scales = scales
         self.gamma = gamma
-        self.temperature = temperature
         n_channels = 3
         
         # Multi-resolution residuals.
@@ -46,9 +46,8 @@ class LimitedPaletteMultiResImage(DifferentiableImage):
                 data = torch.zeros(n_channels, h_down, w_down, device=device)
             self.residuals.append(nn.Parameter(data))
         
-        # Palette: learnable parameter [palette_size, 3] with values in [0,1].
+        # Palette: learnable parameter [palette_size, 3] in [0,1]
         self.palette = nn.Parameter(torch.rand(palette_size, 3, device=device))
-        # Buffer for target palette.
         self.register_buffer('palette_target', torch.empty_like(self.palette))
         self.use_palette_target = False
         
@@ -57,41 +56,65 @@ class LimitedPaletteMultiResImage(DifferentiableImage):
 
     def decode_tensor(self):
         """
-        1. Upsample each multi-resolution residual to (H,W) and sum.
-        2. Apply tanh and map from [-1,1] to [0,1] → continuous image.
-        3. For each pixel, compute squared distances to each palette color and
-           use softmax (with temperature) to blend palette colors.
-        Returns tensor [1, 3, H, W].
+        Decodes the image as follows:
+         1. Upsample each multi-resolution residual to full resolution and sum,
+            then apply tanh and map to [0,1] to obtain a continuous image.
+         2. Compute the luminance (using 0.299, 0.587, 0.114 weights).
+         3. Quantize the luminance into an index between 0 and palette_size-1.
+         4. For each pixel, linearly interpolate between the palette colors at the floor
+            and ceil indices.
+        Returns a tensor of shape [1, 3, H, W] that more faithfully preserves the input colors.
         """
         width, height = self.image_shape
-        n_channels = 3
         device = self.residuals[0].device
 
-        accum = torch.zeros(1, n_channels, height, width, device=device)
+        # 1. Compute continuous image.
+        accum = torch.zeros(1, 3, height, width, device=device)
         for scale, param in zip(self.scales, self.residuals):
             up = F.interpolate(param.unsqueeze(0), size=(height, width),
                                mode='bilinear', align_corners=True)
             accum = accum + up
-        continuous = (torch.tanh(accum) + 1) / 2
+        continuous = (torch.tanh(accum) + 1) / 2  # [1,3,H,W]
+
+        # 2. Compute luminance.
+        R = continuous[:,0:1,:,:]
+        G = continuous[:,1:2,:,:]
+        B = continuous[:,2:3,:,:]
+        lum = 0.299 * R + 0.587 * G + 0.114 * B  # [1,1,H,W]
+
+        # 3. Quantize luminance.
+        palette_size = self.palette.shape[0]
+        index = lum * (palette_size - 1)  # scale lum to [0, palette_size-1]
+        floor_index = index.floor()
+        ceil_index = index.ceil()
+        frac = index - floor_index  # [1,1,H,W], fraction between 0 and 1
+
+        # 4. Get sorted palette.
+        sorted_palette = self.sort_palette()  # [palette_size, 3]
+        # Remove batch and channel dims.
+        floor_index = floor_index.squeeze(0).squeeze(0).long()  # [H,W]
+        ceil_index = ceil_index.squeeze(0).squeeze(0).long()      # [H,W]
+        frac = frac.squeeze(0).squeeze(0)                         # [H,W]
         
-        # Palette quantization.
-        palette = self.palette.view(1, -1, 3, 1, 1)   # [1, palette_size, 3, 1, 1]
-        continuous_exp = continuous.unsqueeze(1)       # [1, 1, 3, H, W]
-        diff = continuous_exp - palette                # [1, palette_size, 3, H, W]
-        dist2 = (diff ** 2).sum(dim=2)                   # [1, palette_size, H, W]
-        logits = -dist2 / self.temperature
-        weights = torch.softmax(logits, dim=1)          # [1, palette_size, H, W]
-        quantized = (weights.unsqueeze(2) * palette).sum(dim=1)  # [1, 3, H, W]
+        # Gather palette colors.
+        # sorted_palette is [palette_size, 3]. For each pixel, get the floor and ceil colors.
+        floor_color = sorted_palette[floor_index]  # [H,W,3]
+        ceil_color = sorted_palette[ceil_index]    # [H,W,3]
+        quantized = floor_color * (1 - frac.unsqueeze(-1)) + ceil_color * frac.unsqueeze(-1)  # [H,W,3]
+
+        # Permute to [1,3,H,W]
+        quantized = quantized.permute(2,0,1).unsqueeze(0)
         return clamp_with_grad(quantized, 0, 1)
 
     def get_image_tensor(self):
-        """Returns decoded tensor with shape [3, H, W]."""
+        """Returns decoded image tensor [3, H, W]."""
         return self.decode_tensor().squeeze(0)
 
     def set_image_tensor(self, tensor):
         """
-        Inverts the tanh mapping and distributes evenly among scales.
-        Expects tensor [3, H, W] in [0,1].
+        Inverts the tanh mapping and distributes evenly among scales,
+        so that decoding yields the provided continuous image.
+        Expects tensor of shape [3, H, W] in [0,1].
         """
         if tensor.ndim != 3:
             raise ValueError(f"Expected tensor with shape [3, H, W], got {tensor.shape}")
@@ -109,10 +132,10 @@ class LimitedPaletteMultiResImage(DifferentiableImage):
     @torch.no_grad()
     def encode_image(self, pil_image, smart_encode=True, device=DEVICE):
         """
-        Converts the image to RGB, applies gamma correction,
-        downsamples to each scale, and maps values to [-1,1].
-        If smart_encode is True, updates the palette via k-means clustering.
-        Optimized: if the image has many pixels, a random sample (e.g., 4096 pixels) is used for clustering.
+        Initializes the multi-resolution residuals from the input image.
+        Converts the image to RGB, applies gamma correction, downsamples it to each scale,
+        and maps the values to [-1,1]. If smart_encode is True, also updates the palette via
+        k-means clustering on a random subsample of pixels.
         """
         pil_image = pil_image.convert('RGB')
         full_tensor = TF.to_tensor(pil_image).to(device)
@@ -125,9 +148,8 @@ class LimitedPaletteMultiResImage(DifferentiableImage):
                                  mode='bilinear', align_corners=True)
             self.residuals[i].data.copy_((down[0] * 2 - 1) / N)
         if smart_encode:
-            # Smart palette encoding: sample a subset of pixels.
             sample_size = 4096
-            flat = full_tensor.view(3, -1).transpose(0, 1)  # shape [num_pixels, 3]
+            flat = full_tensor.view(3, -1).transpose(0, 1)  # [num_pixels, 3]
             num_pixels = flat.shape[0]
             if num_pixels > sample_size:
                 indices = torch.randperm(num_pixels)[:sample_size]
@@ -139,7 +161,6 @@ class LimitedPaletteMultiResImage(DifferentiableImage):
             kmeans = KMeans(n_clusters=n_clusters, random_state=0, n_init=5)
             labels = kmeans.fit_predict(flat_sample.cpu().numpy())
             centers = torch.tensor(kmeans.cluster_centers_, device=device, dtype=self.palette.dtype)
-            # Sort palette by brightness.
             brightness = 0.299 * centers[:,0] + 0.587 * centers[:,1] + 0.114 * centers[:,2]
             sorted_indices = torch.argsort(brightness)
             sorted_palette = centers[sorted_indices]
@@ -148,7 +169,8 @@ class LimitedPaletteMultiResImage(DifferentiableImage):
     @torch.no_grad()
     def encode_random(self, random_palette=False):
         """
-        Overwrites residuals with random noise in [-1,1]. Optionally reinitializes palette randomly.
+        Overwrites the multi-resolution residuals with random noise in [-1,1].
+        If random_palette is True, reinitializes the palette with random values in [0,1].
         """
         for param in self.residuals:
             param.uniform_(-1, 1)
@@ -157,7 +179,7 @@ class LimitedPaletteMultiResImage(DifferentiableImage):
 
     def update(self):
         """
-        Clamps residuals to [-1,1] and palette to [0,1].
+        Clamps the residuals to [-1,1] and the palette to [0,1].
         """
         for param in self.residuals:
             param.data.clamp_(-1, 1)
@@ -167,7 +189,7 @@ class LimitedPaletteMultiResImage(DifferentiableImage):
     def set_palette_target(self, pil_image):
         """
         Updates the palette using k-means clustering on the target image.
-        To speed up, a random subset of pixels is used if the image is large.
+        A random subset of up to 4096 pixels is used to speed up clustering.
         The resulting palette is sorted by brightness and copied into self.palette.
         Also sets use_palette_target=True.
         """
@@ -198,7 +220,7 @@ class LimitedPaletteMultiResImage(DifferentiableImage):
 
     def lock_palette(self, lock=True):
         """
-        When locked, the palette remains fixed during optimization.
+        When locked (lock=True), the palette remains fixed during optimization.
         """
         self.use_palette_target = lock
 
@@ -212,8 +234,8 @@ class LimitedPaletteMultiResImage(DifferentiableImage):
 
 def render_palette(palette, cell_size=32):
     """
-    Renders the palette (tensor of shape [N,3]) as an image.
-    Each color is displayed as a cell of size (cell_size x cell_size).
+    Renders the palette (a tensor of shape [N, 3]) as an image.
+    Each palette color is displayed as a cell of size (cell_size x cell_size).
     """
     import numpy as np
     palette_np = palette.detach().cpu().numpy()
