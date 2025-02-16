@@ -15,10 +15,10 @@ class LimitedPaletteMultiResImage(DifferentiableImage):
     
     This model represents an image using a multi-resolution decomposition 
     (learnable residuals at several scales) and then applies limited palette
-    quantization. The continuous image is formed by a raw summation of the 
-    upsampled residuals (averaged and clamped to avoid brightness overflow) 
-    and then linearly mapped to [0,1]. Its luminance is used to index into a sorted
-    palette (with floor/ceil interpolation) to obtain the final output.
+    quantization. The continuous image is formed by summing the upsampled residuals,
+    averaging the sum to avoid brightness overflow, clamping the average to [-1,1],
+    and then mapping linearly to [0,1]. Its luminance is then used to index into a sorted
+    palette via floor/ceil interpolation.
     
     Parameters:
       - width, height: Final output resolution.
@@ -57,28 +57,29 @@ class LimitedPaletteMultiResImage(DifferentiableImage):
     def decode_tensor(self):
         """
         Decodes the image as follows:
-          1. Upsample each multi-resolution residual to full resolution and sum them.
-          2. Average the sum (to avoid overflow) and clamp the result to [-1,1],
-             then linearly map to [0,1] (i.e. continuous = (avg + 1)/2).
-          3. Compute the luminance of the continuous image.
+          1. Upsample each residual to full resolution and sum them.
+          2. Average the sum (divide by number of scales) and clamp the result to [-1,1],
+             then map linearly to [0,1] via: continuous = (avg_clamped + 1)/2.
+          3. Compute luminance from the continuous image.
           4. Scale luminance to [0, palette_size-1] and use floor/ceil interpolation
-             to select colors from the sorted palette.
+             (with linear blending) on a sorted palette to produce the final output.
+             
         Returns a tensor of shape [1, 3, H, W].
         """
         width, height = self.image_shape
         device = self.residuals[0].device
         
-        # Step 1: Raw summation of upsampled residuals.
+        # Step 1: Sum the upsampled residuals.
         accum = torch.zeros(1, 3, height, width, device=device)
         for scale, param in zip(self.scales, self.residuals):
             up = F.interpolate(param.unsqueeze(0), size=(height, width),
                                mode='bilinear', align_corners=True)
             accum = accum + up
         
-        # Step 2: Average over scales, clamp to [-1,1] then map to [0,1].
+        # Step 2: Average and clamp to avoid overflow, then map to [0,1].
         avg = accum / len(self.scales)
         avg_clamped = torch.clamp(avg, -1, 1)
-        continuous = (avg_clamped + 1) / 2  # Now in [0,1]
+        continuous = (avg_clamped + 1) / 2  # continuous image in [0,1]
         
         # Step 3: Compute luminance.
         R = continuous[:, 0:1, :, :]
@@ -86,9 +87,9 @@ class LimitedPaletteMultiResImage(DifferentiableImage):
         B = continuous[:, 2:3, :, :]
         lum = 0.299 * R + 0.587 * G + 0.114 * B  # [1,1,H,W]
         
-        # Step 4: Quantize luminance.
+        # Step 4: Quantize luminance to obtain palette indices.
         palette_size = self.palette.shape[0]
-        index = lum * (palette_size - 1)  # scale luminance to [0, palette_size-1]
+        index = lum * (palette_size - 1)  # scale lum to [0, palette_size-1]
         floor_index = index.floor()
         ceil_index = index.ceil()
         frac = index - floor_index  # fractional part
@@ -101,25 +102,24 @@ class LimitedPaletteMultiResImage(DifferentiableImage):
         floor_color = sorted_palette[floor_index]  # [H,W,3]
         ceil_color = sorted_palette[ceil_index]    # [H,W,3]
         quantized = floor_color * (1 - frac.unsqueeze(-1)) + ceil_color * frac.unsqueeze(-1)
-        
-        quantized = quantized.permute(2,0,1).unsqueeze(0)  # [1,3,H,W]
+        quantized = quantized.permute(2, 0, 1).unsqueeze(0)  # [1,3,H,W]
         return clamp_with_grad(quantized, 0, 1)
 
     def get_image_tensor(self):
-        """Returns the decoded image tensor [3, H, W]."""
+        """Returns the decoded image tensor with shape [3, H, W]."""
         return self.decode_tensor().squeeze(0)
 
     def set_image_tensor(self, tensor):
         """
-        Inverts the raw summation mapping and distributes evenly among scales.
-        Expects tensor of shape [3, H, W] in [0,1].
+        Inverts the mapping used in decode_tensor and distributes evenly among scales.
+        Expects tensor of shape [3, H, W] in [0,1]. Inversion is done by first mapping
+        [0,1] to [-1,1] and then approximating the pre-summation residuals by downsampling.
         """
         if tensor.ndim != 3:
             raise ValueError(f"Expected tensor with shape [3, H, W], got {tensor.shape}")
         eps = 1e-5
         tensor = tensor.clamp(eps, 1 - eps)
-        # Invert linear mapping: (value + 1)/2 => value = 2*output - 1.
-        pre = 2 * tensor - 1
+        pre = 2 * tensor - 1  # invert linear mapping: (value+1)/2 -> value = 2*output - 1
         N = len(self.scales)
         for i in range(N):
             h_down = self.residuals[i].shape[1]
@@ -148,7 +148,7 @@ class LimitedPaletteMultiResImage(DifferentiableImage):
             self.residuals[i].data.copy_((down[0] * 2 - 1) / N)
         if smart_encode:
             sample_size = 4096
-            flat = full_tensor.view(3, -1).transpose(0, 1)  # [num_pixels, 3]
+            flat = full_tensor.view(3, -1).transpose(0, 1)  # shape: [num_pixels, 3]
             num_pixels = flat.shape[0]
             if num_pixels > sample_size:
                 indices = torch.randperm(num_pixels)[:sample_size]
@@ -168,8 +168,8 @@ class LimitedPaletteMultiResImage(DifferentiableImage):
     @torch.no_grad()
     def encode_random(self, random_palette=False):
         """
-        Overwrites residuals with random noise in [-1,1]. If random_palette is True,
-        reinitializes the palette with random values in [0,1].
+        Overwrites the multi-resolution residuals with random noise in [-1,1].
+        If random_palette is True, reinitializes the palette with random values in [0,1].
         """
         for param in self.residuals:
             param.uniform_(-1, 1)
@@ -178,7 +178,7 @@ class LimitedPaletteMultiResImage(DifferentiableImage):
 
     def update(self):
         """
-        Clamps residuals to [-1,1] and the palette to [0,1].
+        Clamps the residuals to [-1,1] and the palette to [0,1].
         """
         for param in self.residuals:
             param.data.clamp_(-1, 1)
