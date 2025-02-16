@@ -47,7 +47,7 @@ class MultiResImage(DifferentiableImage):
             self.residuals.append(nn.Parameter(data))
         
         self.output_axes = ('n', 's', 'y', 'x')
-        self.lr = 0.218
+        self.lr = 0.1
 
     def decode_tensor(self):
         """
@@ -89,7 +89,7 @@ class MultiResImage(DifferentiableImage):
         Expects `tensor` to have shape [C, H, W] in the [0, 1] range.
         We invert the tanh mapping:
             output = (tanh(sum) + 1)/2   =>   sum = atanh(2*output-1)
-        Since atanh(2*output-1) = 0.5*log( output/(1-output) ),
+        Since atanh(2*output-1) = 0.5 * log(output/(1-output)),
         we distribute the pre-activation value evenly among the scales.
         """
         # Ensure tensor is in the proper shape and range
@@ -110,14 +110,15 @@ class MultiResImage(DifferentiableImage):
             self.residuals[i].data.copy_(down.squeeze(0) / N)
 
     @torch.no_grad()
-    def encode_image(self, pil_image):
+    def encode_image(self, pil_image, smart_encode=True, device=DEVICE):
         """
         Initializes each scale's parameters by downsampling the given image.
         The image is converted to the desired pixel_format, then each scale
         is computed and mapped from [0, 1] to [-1, 1] to match the internal range.
+        The 'smart_encode' parameter is accepted for compatibility but is not used.
         """
         pil_image = pil_image.convert(self.pixel_format)
-        full_tensor = TF.to_tensor(pil_image).to(self.residuals[0].device)
+        full_tensor = TF.to_tensor(pil_image).to(device)
         width, height = self.image_shape
         for i, s in enumerate(self.scales):
             h_down, w_down = self.residuals[i].shape[1], self.residuals[i].shape[2]
