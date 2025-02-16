@@ -53,8 +53,8 @@ class MultiResImage(DifferentiableImage):
         """
         Upsamples each scale to the final resolution, sums them,
         applies tanh, and maps the result from [-1, 1] to [0, 1].
-        The final output tensor has shape [1, C, height, width],
-        with height and width exactly matching the ones provided.
+        Returns a tensor with shape [1, C, height, width],
+        where height and width match self.image_shape.
         """
         # self.image_shape is (width, height)
         width, height = self.image_shape
@@ -76,6 +76,14 @@ class MultiResImage(DifferentiableImage):
         image = (torch.tanh(accum) + 1) / 2
         return clamp_with_grad(image, 0, 1)
 
+    def get_image_tensor(self):
+        """
+        Returns the decoded tensor directly.
+        This avoids using a PIL conversion and ensures that the image tensor
+        has the expected dimensions (matching self.image_shape).
+        """
+        return self.decode_tensor()
+
     @torch.no_grad()
     def encode_image(self, pil_image):
         """
@@ -95,7 +103,8 @@ class MultiResImage(DifferentiableImage):
                 align_corners=True
             )
             # Map from [0,1] to [-1,1]
-            self.residuals[self.scales.index(scale)].copy_(down[0] * 2 - 1)
+            idx = self.scales.index(scale)
+            self.residuals[idx].copy_(down[0] * 2 - 1)
 
     @torch.no_grad()
     def encode_random(self):
