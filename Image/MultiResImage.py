@@ -81,8 +81,32 @@ class MultiResImage(DifferentiableImage):
         Returns the decoded tensor with shape [C, height, width].
         This ensures downstream transforms (like zoom_3d) receive the expected dimensions.
         """
-        # Squeeze out the batch dimension.
         return self.decode_tensor().squeeze(0)
+
+    def set_image_tensor(self, tensor):
+        """
+        Sets the internal multi-resolution parameters so that decoding yields the provided tensor.
+        Expects `tensor` to have shape [C, H, W] in the [0, 1] range.
+        We invert the tanh mapping:
+            output = (tanh(sum) + 1)/2   =>   sum = atanh(2*output - 1)
+        and then distribute the pre-activation value evenly among the scales.
+        """
+        # Ensure tensor is in the proper shape and range
+        if tensor.ndim != 3:
+            raise ValueError(f"Expected tensor with shape [C, H, W], got {tensor.shape}")
+        eps = 1e-5
+        tensor = tensor.clamp(eps, 1 - eps)
+        # Invert mapping: compute pre-activation values
+        pre = 0.5 * torch.log((2 * tensor) / (1 - tensor))  # atanh(2*output-1)
+        # Distribute pre-activation evenly among scales
+        N = len(self.scales)
+        for i, s in enumerate(self.scales):
+            # Downsample pre to the size of this scale
+            h_down = self.residuals[i].shape[1]
+            w_down = self.residuals[i].shape[2]
+            down = F.interpolate(pre.unsqueeze(0), size=(h_down, w_down), mode='bilinear', align_corners=True)
+            # Set the parameter for this scale as pre / N
+            self.residuals[i].data.copy_(down.squeeze(0) / N)
 
     @torch.no_grad()
     def encode_image(self, pil_image):
@@ -94,17 +118,15 @@ class MultiResImage(DifferentiableImage):
         pil_image = pil_image.convert(self.pixel_format)
         full_tensor = TF.to_tensor(pil_image).to(self.residuals[0].device)
         width, height = self.image_shape
-        for scale, param in zip(self.scales, self.residuals):
-            h_down, w_down = param.shape[1], param.shape[2]
+        for i, s in enumerate(self.scales):
+            h_down, w_down = self.residuals[i].shape[1], self.residuals[i].shape[2]
             down = F.interpolate(
                 full_tensor.unsqueeze(0),
                 size=(h_down, w_down),
                 mode='bilinear',
                 align_corners=True
             )
-            # Map from [0,1] to [-1,1]
-            idx = self.scales.index(scale)
-            self.residuals[idx].copy_(down[0] * 2 - 1)
+            self.residuals[i].copy_(down[0] * 2 - 1)
 
     @torch.no_grad()
     def encode_random(self):
