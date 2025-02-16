@@ -15,6 +15,8 @@ class MultiResImage(DifferentiableImage):
     This class stores learnable residuals at several downscaled resolutions.
     In decoding, each residual is upsampled to the final output size, summed,
     passed through a tanh, and then mapped to [0, 1].
+    
+    A gamma parameter is applied during encoding to adjust brightness/contrast.
     """
     def __init__(self,
                  width,
@@ -22,20 +24,22 @@ class MultiResImage(DifferentiableImage):
                  pixel_format='RGB',
                  scales=(1, 2, 4, 8, 16),
                  init='random',
+                 gamma=0.8,
                  device=DEVICE):
         """
         width, height: Final output resolution (in pixels).
         pixel_format : PIL image mode (e.g., 'RGB', 'L', etc.).
         scales       : A tuple of downscale factors for multi-resolution components.
         init         : Initialization mode ('random' or 'zeros').
+        gamma        : Gamma correction to apply when encoding an image.
         device       : Torch device to use.
         """
         super().__init__(width, height, pixel_format)
-        # Make sure we have a proper pixel_format string
-        self.pixel_format = pixel_format
+        self.pixel_format = pixel_format  # ensure proper string assignment
         self.scales = scales
+        self.gamma = gamma
         n_channels = 3 if pixel_format == 'RGB' else 1
-        
+
         # Create a learnable parameter for each scale.
         self.residuals = nn.ParameterList()
         for s in scales:
@@ -47,7 +51,7 @@ class MultiResImage(DifferentiableImage):
             else:
                 data = torch.zeros(n_channels, h_down, w_down, device=device)
             self.residuals.append(nn.Parameter(data))
-        
+
         self.output_axes = ('n', 's', 'y', 'x')
         self.lr = 0.1
 
@@ -61,7 +65,7 @@ class MultiResImage(DifferentiableImage):
         width, height = self.image_shape
         n_channels = 3 if self.pixel_format == 'RGB' else 1
         device = self.residuals[0].device
-        
+
         accum = torch.zeros(1, n_channels, height, width, device=device)
         for scale, param in zip(self.scales, self.residuals):
             up = F.interpolate(
@@ -105,27 +109,26 @@ class MultiResImage(DifferentiableImage):
     def encode_image(self, pil_image, smart_encode=True, device=DEVICE):
         """
         Initializes each scale's parameters by downsampling the given image.
-        The image is converted to the desired pixel_format, then each scale
-        is computed and mapped from [0, 1] to [-1, 1] to match the internal range.
+        The image is converted to the desired pixel_format, then gamma-corrected,
+        downsampled, and mapped from [0, 1] to [-1, 1] to match the internal range.
         The 'smart_encode' parameter is accepted for compatibility.
         """
         pil_image = pil_image.convert(self.pixel_format)
         full_tensor = TF.to_tensor(pil_image).to(device)
+        # Apply gamma correction (using exponent self.gamma)
+        corrected = full_tensor.pow(self.gamma)
         width, height = self.image_shape
         N = len(self.scales)
         for i, s in enumerate(self.scales):
             h_down, w_down = self.residuals[i].shape[1], self.residuals[i].shape[2]
             down = F.interpolate(
-                full_tensor.unsqueeze(0),
+                corrected.unsqueeze(0),
                 size=(h_down, w_down),
                 mode='bilinear',
                 align_corners=True
             )
-            # Divide by N to distribute the pre-activation evenly
-            self.residuals[i].copy_(down[0] * 1.328 - 1 / N)
-
-            # Alternatively, if you want to be explicit:
-            # self.residuals[i].copy_((down[0] * 2 - 1) / N)
+            # Distribute the pre-activation evenly among scales:
+            self.residuals[i].copy_((down[0] * 2 - 1) / N)
 
     @torch.no_grad()
     def encode_random(self):
