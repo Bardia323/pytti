@@ -358,6 +358,22 @@ class DiffLogicCAImage(DifferentiableImage):
         # No internal loss for now
         return 0 
 
+    def decode_tensor(self):
+        """
+        Convert the CA state to an RGB image tensor.
+        Returns a decoded tensor of this image.
+        """
+        # Take the first rgb_channels of the state as RGB values
+        rgb_values = self.state[..., :self.rgb_channels]
+        
+        # Convert from (height, width, channels) to (channels, height, width)
+        rgb_tensor = rgb_values.permute(2, 0, 1)
+        
+        # Make sure values are between 0 and 1
+        rgb_tensor = rgb_tensor.clamp(0, 1)
+        
+        return rgb_tensor
+
 def init_difflogic_ca():
     """
     Initialize DiffLogicCA system.
