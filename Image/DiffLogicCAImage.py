@@ -87,6 +87,14 @@ class PerceptionCircuit(nn.Module):
         for i in range(1, len(num_gates)):
             layer = nn.ModuleList([LogicGate(device) for _ in range(num_gates[i])])
             self.layers.append(layer)
+        
+        # Try to JIT compile for speed
+        try:
+            for i, layer in enumerate(self.layers):
+                for j, gate in enumerate(layer):
+                    self.layers[i][j] = torch.jit.script(gate)
+        except Exception as e:
+            print(f"Warning: Could not JIT compile gates: {e}")
             
     def forward(self, neighborhood, hard=False):
         """
@@ -95,52 +103,71 @@ class PerceptionCircuit(nn.Module):
         Returns: tensor of shape (batch, 1)
         """
         batch_size = neighborhood.shape[0]
-        center = neighborhood[:, :, 1, 1]  # Center cell values
+        center = neighborhood[:, :, 1, 1]  # Center cell values (batch, channels)
+        
+        # Vectorized extraction of neighbors (without center)
+        # Create a mask to exclude the center
+        mask = torch.ones(3, 3, device=neighborhood.device)
+        mask[1, 1] = 0
+        
+        # Extract neighbors using mask
+        neighbors = neighborhood * mask.view(1, 1, 3, 3)
+        neighbors = neighbors.reshape(batch_size, self.channels, -1)
+        
+        # Reshape for efficiency: each neighborhood now has 8 neighbors (excluding center)
+        neighbors = torch.cat([
+            neighbors[:, :, :4], 
+            neighbors[:, :, 5:]
+        ], dim=2)  # (batch, channels, 8)
         
         # First layer: connect center with neighbors
         outputs = []
-        for gate in self.layers[0]:
-            results = []
-            for b in range(batch_size):
-                # For each sample, connect center with each neighbor
-                center_val = center[b]
-                neighbors = neighborhood[b].view(-1)  # Flatten the 3x3 grid
-                # Remove center (which is at index 4 in the flattened grid)
-                neighbors = torch.cat([neighbors[:4], neighbors[5:]])
-                
-                # Apply gate between center and each neighbor
-                gate_results = []
-                for i in range(8):  # 8 neighbors
-                    gate_results.append(gate(center_val, neighbors[i], hard))
-                
-                # Combine results (could be adjusted based on task)
-                results.append(torch.stack(gate_results))
-            
-            outputs.append(torch.stack(results))
         
-        # Process through remaining layers
+        for gate in self.layers[0]:
+            # Process all batch items at once for this gate
+            gate_results = []
+            
+            # Apply gate between center and each neighbor across all batch items
+            for i in range(8):  # 8 neighbors
+                # Broadcast center against each neighbor position
+                center_expanded = center.unsqueeze(-1)  # (batch, channels, 1)
+                neighbor_i = neighbors[:, :, i].unsqueeze(-1)  # (batch, channels, 1)
+                
+                # Apply gate efficiently
+                results = torch.cat([
+                    gate(center_expanded[:, c], neighbor_i[:, c], hard).unsqueeze(1)
+                    for c in range(self.channels)
+                ], dim=1)
+                gate_results.append(results)
+            
+            # Stack results for this gate
+            gate_output = torch.stack(gate_results, dim=2)  # (batch, channels, 8)
+            outputs.append(gate_output)
+        
+        # Process through remaining layers using vectorized operations
         for layer_idx in range(1, len(self.layers)):
             layer = self.layers[layer_idx]
             prev_outputs = outputs
             outputs = []
             
             for gate_idx, gate in enumerate(layer):
-                inputs1 = prev_outputs[gate_idx * 2] if gate_idx * 2 < len(prev_outputs) else prev_outputs[-1]
-                inputs2 = prev_outputs[gate_idx * 2 + 1] if gate_idx * 2 + 1 < len(prev_outputs) else prev_outputs[-1]
+                input1_idx = gate_idx * 2
+                input2_idx = gate_idx * 2 + 1
                 
-                results = []
-                for b in range(batch_size):
-                    # Apply gate to pairs of previous layer outputs
-                    gate_results = []
-                    for i in range(inputs1[b].shape[0]):
-                        idx2 = min(i, inputs2[b].shape[0]-1)
-                        gate_results.append(gate(inputs1[b][i], inputs2[b][idx2], hard))
-                    results.append(torch.stack(gate_results))
+                input1 = prev_outputs[min(input1_idx, len(prev_outputs)-1)]
+                input2 = prev_outputs[min(input2_idx, len(prev_outputs)-1)]
                 
-                outputs.append(torch.stack(results))
+                # Apply gate to paired inputs from previous layer
+                gate_output = torch.cat([
+                    gate(input1[:, c], input2[:, c], hard).unsqueeze(1)
+                    for c in range(self.channels)
+                ], dim=1)
+                
+                outputs.append(gate_output)
         
         # Final layer should have a single output per sample
-        return outputs[0].squeeze()
+        # Average across channels for stability
+        return outputs[0].mean(dim=(1,2))
 
 
 class UpdateCircuit(nn.Module):
@@ -166,6 +193,22 @@ class UpdateCircuit(nn.Module):
         for size in sizes:
             layer = nn.ModuleList([LogicGate(device) for _ in range(size)])
             self.layers.append(layer)
+            
+        # Cache layer indices for faster access
+        self.layer_input_indices = []
+        for layer_idx in range(len(self.layers)):
+            indices = []
+            for gate_idx in range(len(self.layers[layer_idx])):
+                if layer_idx == 0:
+                    # For first layer, use consecutive inputs
+                    idx1 = gate_idx * 2
+                    idx2 = gate_idx * 2 + 1
+                else:
+                    # For later layers, connect pairs from previous layer
+                    idx1 = gate_idx * 2
+                    idx2 = gate_idx * 2 + 1
+                indices.append((idx1, idx2))
+            self.layer_input_indices.append(indices)
     
     def forward(self, perception_outputs, current_state, hard=False):
         """
@@ -178,30 +221,37 @@ class UpdateCircuit(nn.Module):
         x = torch.cat([perception_outputs, current_state], dim=1)
         
         # Process through layers
+        prev_x = None
+        
         for layer_idx, layer in enumerate(self.layers):
-            next_x = []
-            
-            for gate_idx, gate in enumerate(layer):
-                # Each gate takes two inputs from the previous layer
-                if layer_idx == 0:
-                    # For the first layer, use consecutive inputs
-                    if gate_idx * 2 + 1 < x.shape[1]:
-                        out = gate(x[:, gate_idx * 2], x[:, gate_idx * 2 + 1], hard)
-                    else:
-                        # If odd number of inputs, duplicate the last one
-                        out = gate(x[:, -1], x[:, -1], hard)
-                else:
-                    # For subsequent layers, connect pairs from previous layer
-                    if gate_idx * 2 + 1 < len(prev_x):
-                        out = gate(prev_x[gate_idx * 2], prev_x[gate_idx * 2 + 1], hard)
-                    elif gate_idx * 2 < len(prev_x):
-                        # If odd number of gates, duplicate the last one
-                        out = gate(prev_x[gate_idx * 2], prev_x[gate_idx * 2], hard)
-                    else:
-                        # If we need more outputs than previous layer had, reuse the last one
-                        out = gate(prev_x[-1], prev_x[-1], hard)
-                
-                next_x.append(out)
+            if layer_idx == 0:
+                # First layer processes raw inputs
+                next_x = []
+                for gate_idx, gate in enumerate(layer):
+                    input_indices = self.layer_input_indices[layer_idx][gate_idx]
+                    idx1, idx2 = input_indices
+                    
+                    # Handle edge cases
+                    idx1 = min(idx1, x.shape[1]-1)
+                    idx2 = min(idx2, x.shape[1]-1)
+                    
+                    # Apply gate vectorized across batch
+                    out = gate(x[:, idx1], x[:, idx2], hard)
+                    next_x.append(out)
+            else:
+                # Subsequent layers process previous layer outputs
+                next_x = []
+                for gate_idx, gate in enumerate(layer):
+                    input_indices = self.layer_input_indices[layer_idx][gate_idx]
+                    idx1, idx2 = input_indices
+                    
+                    # Handle edge cases
+                    idx1 = min(idx1, len(prev_x)-1)
+                    idx2 = min(idx2, len(prev_x)-1)
+                    
+                    # Apply gate vectorized across batch
+                    out = gate(prev_x[idx1], prev_x[idx2], hard)
+                    next_x.append(out)
             
             prev_x = next_x
         
@@ -232,6 +282,12 @@ class DiffLogicCAImage(DifferentiableImage):
         
         # Initialize update circuit
         self.update_circuit = UpdateCircuit(perception_kernels, ca_channels, device)
+        
+        # JIT compile the update circuit for speed
+        try:
+            self.update_circuit = torch.jit.script(self.update_circuit)
+        except Exception as e:
+            print(f"Warning: Could not JIT compile update circuit: {e}")
         
         # Output processing: convert the first rgb_channels to actual RGB values
         self.output_axes = ('s', 'y', 'x')
@@ -272,23 +328,19 @@ class DiffLogicCAImage(DifferentiableImage):
         batch_size = self.height * self.width
         height, width, channels = self.state.shape
         
-        # Create neighborhood for each cell
-        padded = F.pad(self.state.permute(2, 0, 1), [1, 1, 1, 1], mode='replicate')
-        neighborhoods = []
+        # Vectorized neighborhood extraction using unfold
+        state_chw = self.state.permute(2, 0, 1).unsqueeze(0)  # [1, C, H, W]
+        padded = F.pad(state_chw, [1, 1, 1, 1], mode='replicate')
+        unfold = nn.Unfold(kernel_size=3, padding=0)
+        neighborhoods = unfold(padded)  # [1, C*9, H*W]
+        neighborhoods = neighborhoods.view(channels, 9, -1).permute(2, 0, 1)  # [H*W, C, 9]
+        neighborhoods = neighborhoods.reshape(-1, channels, 3, 3)  # [batch, C, 3, 3]
         
-        for i in range(height):
-            for j in range(width):
-                neighborhood = padded[:, i:i+3, j:j+3]
-                neighborhoods.append(neighborhood)
-        
-        neighborhoods = torch.stack(neighborhoods)  # (batch, channels, 3, 3)
-        
-        # Apply perception kernels
-        perception_outputs = []
-        for kernel in self.perception_kernels:
-            perception_outputs.append(kernel(neighborhoods, hard))
-        
-        perception_outputs = torch.stack(perception_outputs, dim=1)  # (batch, num_kernels)
+        # Batch process perception circuits
+        perception_outputs = torch.cat([
+            kernel(neighborhoods, hard).unsqueeze(1) 
+            for kernel in self.perception_kernels
+        ], dim=1)  # [batch, num_kernels]
         
         # Current cell states
         current_states = self.state.reshape(batch_size, channels)
@@ -304,8 +356,14 @@ class DiffLogicCAImage(DifferentiableImage):
         if steps is None:
             steps = self.steps
         
-        for _ in range(steps):
-            self.step(hard)
+        # Use torch.no_grad for inference if not training
+        if not self.training and not hard:
+            with torch.no_grad():
+                for _ in range(steps):
+                    self.step(hard)
+        else:
+            for _ in range(steps):
+                self.step(hard)
     
     @torch.no_grad()
     def update(self):
