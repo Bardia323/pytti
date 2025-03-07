@@ -355,8 +355,9 @@ class DiffLogicCAImage(DifferentiableImage):
     
     def image_loss(self):
         """Calculate internal loss for the image"""
-        # No internal loss for now
-        return 0 
+        # Return an empty list instead of 0
+        # This indicates we have no special image-specific losses
+        return []
 
     def decode_tensor(self):
         """
