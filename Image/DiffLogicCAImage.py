@@ -234,7 +234,7 @@ class DiffLogicCAImage(DifferentiableImage):
         self.update_circuit = UpdateCircuit(perception_kernels, ca_channels, device)
         
         # Output processing: convert the first rgb_channels to actual RGB values
-        self.output_axes = ('c', 'y', 'x')
+        self.output_axes = ('s', 'y', 'x')
         self.lr = 1e-3
     
     def clone(self):
