@@ -234,7 +234,7 @@ class DiffLogicCAImage(DifferentiableImage):
         self.update_circuit = UpdateCircuit(perception_kernels, ca_channels, device)
         
         # Output processing: convert the first rgb_channels to actual RGB values
-        self.output_axes = ('c', 'y', 'x')
+        self.output_axes = ('n', 'c', 'y', 'x')
         self.lr = 1e-3
     
     def clone(self):
@@ -366,9 +366,9 @@ class DiffLogicCAImage(DifferentiableImage):
         # Take the first rgb_channels of the state as RGB values
         rgb_values = self.state[..., :self.rgb_channels]
         
-        # The output_axes is ('n', 's', 'y', 'x')
+        # The output_axes is ('n', 'c', 'y', 'x')
         # We need to return a tensor with shape [1, 3, height, width]
-        # 'n' is batch size (1), 's' is channels (3), 'y' is height, 'x' is width
+        # 'n' is batch size (1), 'c' is channels (3), 'y' is height, 'x' is width
         
         # Convert from (height, width, channels) to (batch, channels, height, width)
         rgb_tensor = rgb_values.permute(2, 0, 1).unsqueeze(0)
