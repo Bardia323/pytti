@@ -312,7 +312,7 @@ class DiffLogicCAImage(DifferentiableImage):
         """Run the CA and update the image"""
         self.run_ca(hard=True)  # Use hard (discrete) inference
     
-    def encode_image(self, pil_image, device=DEVICE):
+    def encode_image(self, pil_image, smart_encode=True, device=DEVICE):
         """Convert a PIL image to CA state"""
         # Resize the image
         pil_image = pil_image.resize((self.width, self.height), Image.LANCZOS)
@@ -321,7 +321,13 @@ class DiffLogicCAImage(DifferentiableImage):
         img_tensor = TF.to_tensor(pil_image).to(device)
         
         # Initialize first rgb_channels with the image values (binarized)
-        rgb = (img_tensor > 0.5).float()
+        # If smart_encode is True, we can use a more sophisticated encoding
+        if smart_encode:
+            # You can implement a more sophisticated encoding here if needed
+            # For now, just use the same binarization
+            rgb = (img_tensor > 0.5).float()
+        else:
+            rgb = (img_tensor > 0.5).float()
         
         # Initialize state
         state = torch.zeros(self.height, self.width, self.ca_channels, device=device)
