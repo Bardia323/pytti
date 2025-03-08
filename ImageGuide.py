@@ -1,4 +1,4 @@
-from torch import optim, nn
+from torch import optim, nn, randn_like, zeros_like, rand_like
 from pytti.Notebook import tqdm
 from pytti import *
 import pandas as pd
@@ -206,13 +206,13 @@ class SwarmImageGuide():
             
             # Add some random noise to create diversity
             for p in particle_params:
-                noise = torch.randn_like(p) * 0.01  # Small random variations
+                noise = randn_like(p) * 0.01  # Small random variations
                 p.add_(noise)
             
             self.particles.append(particle_params)
             
             # Initialize velocities to zero
-            velocity = [torch.zeros_like(p) for p in particle_params]
+            velocity = [zeros_like(p) for p in particle_params]
             self.velocities.append(velocity)
             
             # Initialize personal best to the starting position
@@ -311,8 +311,8 @@ class SwarmImageGuide():
         for idx in range(self.num_particles):
             for j, param in enumerate(self.particles[idx]):
                 # Random coefficients
-                r1 = torch.rand_like(param)
-                r2 = torch.rand_like(param)
+                r1 = rand_like(param)
+                r2 = rand_like(param)
                 
                 # Update velocity
                 cognitive_component = self.c1 * r1 * (self.personal_bests[idx][j] - param)
