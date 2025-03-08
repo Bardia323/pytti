@@ -1,458 +1,216 @@
 from pytti import *
 from pytti.Image import DifferentiableImage
-from pytti.Image.RGBImage import RGBImage  # Import the known working version
-from pytti.LossAug import HSVLoss
-from pytti.ImageGuide import DirectImageGuide
-from pytti.Image.PixelImage import HdrLoss, PalletLoss
-import torch
 from torch import nn, optim
 from torch.nn import functional as F
 from torchvision.transforms import functional as TF
 from PIL import Image
 import numpy as np
+import torch
 
 class CAModel(nn.Module):
-    """Neural network for CA updates with stronger visual effects"""
-    def __init__(self, hidden_channels=32):
-        super().__init__()
-        self.hidden_channels = hidden_channels
-        
-        # Perception network
-        self.perception = nn.Sequential(
-            nn.Conv2d(3, hidden_channels, kernel_size=3, padding=1),
-            nn.LeakyReLU(0.2),
-            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1),
-            nn.LeakyReLU(0.2),
-        )
-        
-        # Update network - stronger updates
-        self.update = nn.Sequential(
-            nn.Conv2d(hidden_channels + 3 + 3, hidden_channels, kernel_size=1),
-            nn.LeakyReLU(0.2),
-            nn.Conv2d(hidden_channels, 3, kernel_size=1),
-            nn.Tanh(),
-        )
+    """PyTorch implementation of the Growing Neural Cellular Automata model"""
     
-    def forward(self, current_state, clip_gradients, step_size=0.3):
-        """
-        current_state: [B, 3, H, W] tensor of current RGB values
-        clip_gradients: [B, 3, H, W] tensor of gradients from CLIP loss
-        step_size: How strong the updates should be (higher = more visible)
-        """
-        # Perceive local patterns
-        perception_features = self.perception(current_state)
-        
-        # Normalize clip gradients
-        norm_grad = clip_gradients / (clip_gradients.std() + 1e-8) * 0.2
-        
-        # Concatenate features, current state, and gradients
-        combined = torch.cat([perception_features, current_state, norm_grad], dim=1)
-        
-        # Compute update with stronger effect
-        update_values = self.update(combined)
-        
-        # Apply update with larger step size for visibility
-        new_state = current_state + update_values * step_size
-        
-        return new_state.clamp(0, 1)
-
-# Compile frequently called function with TorchScript for speed
-@torch.jit.script
-def break_tensor(tensor):
-    floors = tensor.floor().long()
-    ceils = tensor.ceil().long()
-    rounds = tensor.round().long()
-    fracs = tensor - floors
-    return floors, ceils, rounds, fracs
-
-class PalletLoss(nn.Module):
-    def __init__(self, n_pallets, weight=0.15, device=DEVICE):
+    def __init__(self, channel_n=16, fire_rate=0.5):
         super().__init__()
-        self.n_pallets = n_pallets
-        # Explicitly set type to float32
-        self.register_buffer('weight', torch.as_tensor(weight, dtype=torch.float32, device=device))
-
-    def forward(self, input):
-        if isinstance(input, GNCAImage):
-            tensor = input.tensor.movedim(0, -1).contiguous().view(-1, self.n_pallets)
-            tensor = F.softmax(tensor, dim=-1)
-            N, n = tensor.shape
-            mu = tensor.mean(dim=0, keepdim=True)
-            epsilon = 1e-8
-            sigma = tensor.std(dim=0, keepdim=True) + epsilon
-            tensor_centered = tensor - mu
-            S = (tensor_centered.transpose(0, 1) @ tensor_centered).div(sigma * sigma.transpose(0, 1) * N)
-            S = S - torch.diag(S.diagonal())
-            loss_raw = S.mean()
-            loss_raw = loss_raw + sigma.mul(N).pow(-1).mean()
-            return loss_raw * self.weight, loss_raw
-        else:
-            return 0, 0
-
-    @torch.no_grad()
-    def set_weight(self, weight, device=DEVICE):
-        # Ensure the weight is a float32 tensor
-        self.weight.set_(torch.as_tensor(weight, dtype=torch.float32, device=device))
-
-    def __str__(self):
-        return "Palette normalization"
-
-class HdrLoss(nn.Module):
-    def __init__(self, pallet_size, n_pallets, gamma=2.5, weight=0.15, device=DEVICE):
-        super().__init__()
-        self.register_buffer('comp', torch.linspace(0, 1, pallet_size).pow(gamma).view(pallet_size, 1).repeat(1, n_pallets).to(device))
-        # Explicitly set type to float32
-        self.register_buffer('weight', torch.as_tensor(weight, dtype=torch.float32, device=device))
-
-    def forward(self, input):
-        if isinstance(input, GNCAImage):
-            pallet = input.sort_pallet()
-            magic_color = pallet.new_tensor([[[0.299, 0.587, 0.114]]])
-            color_norms = torch.linalg.vector_norm(pallet * magic_color.sqrt(), dim=-1)
-            loss_raw = F.mse_loss(color_norms, self.comp)
-            return loss_raw * self.weight, loss_raw
-        else:
-            return 0, 0
-
-    @torch.no_grad()
-    def set_weight(self, weight, device=DEVICE):
-        # Ensure the weight is a float32 tensor
-        self.weight.set_(torch.as_tensor(weight, dtype=torch.float32, device=device))
-
-    def __str__(self):
-        return "HDR normalization"
+        self.channel_n = channel_n
+        self.fire_rate = fire_rate
+        
+        # Perception kernels
+        self.register_buffer('identity', torch.tensor([0, 1, 0, 1, 0, 1, 0, 1, 0], dtype=torch.float32).reshape(3, 3))
+        self.register_buffer('dx', torch.tensor([1, 2, 1, 0, 0, 0, -1, -2, -1], dtype=torch.float32).reshape(3, 3) / 8.0)
+        self.register_buffer('dy', torch.tensor([1, 0, -1, 2, 0, -2, 1, 0, -1], dtype=torch.float32).reshape(3, 3) / 8.0)
+        
+        # Update network
+        self.dmodel = nn.Sequential(
+            nn.Conv2d(channel_n * 3, 128, 1),
+            nn.ReLU(),
+            nn.Conv2d(128, channel_n, 1, bias=False)
+        )
+        # Initialize last layer to zeros for stability
+        self.dmodel[-1].weight.data.zero_()
+    
+    def perceive(self, x, angle=0.0):
+        """Apply perception kernels to the input tensor"""
+        batch_size, c, h, w = x.shape
+        
+        # Prepare kernels
+        identity = self.identity
+        dx, dy = self.dx, self.dy
+        
+        # Apply rotation if needed
+        if angle != 0.0:
+            c, s = torch.cos(torch.tensor(angle)), torch.sin(torch.tensor(angle))
+            new_dx = c * dx - s * dy
+            new_dy = s * dx + c * dy
+            dx, dy = new_dx, new_dy
+        
+        # Stack kernels for all channels
+        kernel = torch.stack([identity, dx, dy], dim=0)  # [3, 3, 3]
+        kernel = kernel.reshape(3, 1, 3, 3).repeat(1, self.channel_n, 1, 1)  # [3, channel_n, 3, 3]
+        kernel = kernel.reshape(3 * self.channel_n, 1, 3, 3)
+        
+        # Apply convolution
+        x = x.reshape(batch_size * self.channel_n, 1, h, w)
+        y = F.conv2d(x, kernel, padding=1, groups=self.channel_n)
+        y = y.reshape(batch_size, 3 * self.channel_n, h, w)
+        return y
+    
+    def get_living_mask(self, x):
+        """Determine which cells are alive based on alpha channel"""
+        alpha = x[:, 3:4, :, :]
+        return F.max_pool2d(alpha, 3, stride=1, padding=1) > 0.1
+    
+    def forward(self, x, fire_rate=None, angle=0.0, step_size=1.0):
+        """Run one step of the CA model"""
+        pre_life_mask = self.get_living_mask(x)
+        
+        # Perceive neighborhood
+        y = self.perceive(x, angle)
+        
+        # Compute update
+        dx = self.dmodel(y) * step_size
+        
+        # Apply stochastic update
+        if fire_rate is None:
+            fire_rate = self.fire_rate
+        update_mask = (torch.rand_like(x[:, :1]) <= fire_rate).float()
+        x = x + dx * update_mask
+        
+        # Apply life mask
+        post_life_mask = self.get_living_mask(x)
+        life_mask = pre_life_mask & post_life_mask
+        
+        return x * life_mask.float()
 
 class GNCAImage(DifferentiableImage):
     """
-    GNCA-based image with palette support for color stability
+    Differentiable image powered by Growing Neural Cellular Automata.
+    Provides the same interface as PixelImage for compatibility.
     """
     
-    @vram_usage_mode('GNCA Palette Image')
-    def __init__(self, width, height, scale=1, pallet_size=8, n_pallets=8, 
-                 gamma=1, hdr_weight=0.5, norm_weight=0.1, device=DEVICE):
-        super().__init__(width * scale, height * scale)
-        
-        # Palette parameters
-        self.pallet_inertia = 2
-        pallet = torch.linspace(0, self.pallet_inertia, pallet_size).pow(gamma).view(pallet_size, 1, 1).repeat(1, n_pallets, 3)
-        self.pallet = nn.Parameter(pallet.to(device, dtype=torch.float32))
-        self.pallet_size = pallet_size
-        self.n_pallets = n_pallets
-        
-        # Value and tensor parameters (like PixelImage)
-        self.value = nn.Parameter(torch.zeros(height, width, dtype=torch.float32, device=device))
-        self.tensor = nn.Parameter(torch.zeros(n_pallets, height, width, dtype=torch.float32, device=device))
-        
-        # GNCA parameters
+    @vram_usage_mode('Growing Neural CA Image')
+    def __init__(self, width, height, scale=1, channel_n=16, device=DEVICE):
+        super().__init__(width, height)
         self.scale = scale
+        self.channel_n = channel_n
+        
+        # Create the CA model
+        self.ca_model = CAModel(channel_n=channel_n).to(device)
+        
+        # CA state (RGBA + hidden channels)
+        self.state = nn.Parameter(torch.zeros(1, channel_n, height, width, device=device))
+        
+        # For targeting specific images
+        self.target_image = None
+        self.use_target = False
+        self.output_axes = ('n', 'c', 'y', 'x')
         self.steps_per_update = 1
-        self.update_mode = 'grow'  # 'grow' or 'none'
         
-        # Register buffers for CA state
-        self.register_buffer('alive_mask', torch.zeros(1, height, width, device=device))
-        self.register_buffer('grad_buffer', torch.zeros_like(self.tensor))
-        self.register_buffer('pallet_target', torch.empty_like(self.pallet))
-        self.use_pallet_target = False
-        
-        # Output format
-        self.output_axes = ('n', 's', 'y', 'x')
-        self.latent_strength = 0.1
-        
-        # Loss functions like PixelImage
-        self.hdr_loss = HdrLoss(pallet_size, n_pallets, gamma, hdr_weight) if hdr_weight != 0 else None
-        self.loss = PalletLoss(n_pallets, norm_weight)
-        
-        # Initialize with a pattern
+        # Set the seed (center pixel)
         self.reset_state()
+    
+    def reset_state(self):
+        """Reset the CA state to a single seed in the center"""
+        with torch.no_grad():
+            self.state.zero_()
+            h, w = self.state.shape[2:]
+            cx, cy = w // 2, h // 2
+            self.state[0, 3:, cy-1:cy+1, cx-1:cx+1] = 1.0  # Set alive state for seed
     
     def clone(self):
         """Create a clone of this image"""
         width, height = self.image_shape
-        dummy = GNCAImage(width // self.scale, height // self.scale, self.scale, self.pallet_size, self.n_pallets,
-                          hdr_weight=0 if self.hdr_loss is None else float(self.hdr_loss.weight),
-                          norm_weight=float(self.loss.weight))
+        clone = GNCAImage(width, height, self.scale, self.channel_n)
         with torch.no_grad():
-            dummy.value.copy_(self.value)
-            dummy.tensor.copy_(self.tensor)
-            dummy.pallet.copy_(self.pallet)
-            dummy.alive_mask.copy_(self.alive_mask)
-            dummy.grad_buffer.copy_(self.grad_buffer)
-            dummy.pallet_target.copy_(self.pallet_target)
-            dummy.use_pallet_target = self.use_pallet_target
-            dummy.steps_per_update = self.steps_per_update
-            dummy.update_mode = self.update_mode
-        return dummy
-    
-    def reset_state(self):
-        """Initialize with a basic pattern"""
-        with torch.no_grad():
-            # Initialize palette with smooth gradient
-            for i in range(self.n_pallets):
-                self.pallet[:, i, 0] = torch.linspace(0.2, 0.8, self.pallet_size)  # Red
-                self.pallet[:, i, 1] = torch.linspace(0.8, 0.2, self.pallet_size)  # Green
-                self.pallet[:, i, 2] = torch.sin(torch.linspace(0, 3.14, self.pallet_size)) * 0.5 + 0.5  # Blue
-            
-            # Create a simple pattern
-            h, w = self.value.shape
-            y = torch.linspace(0, 1, h).view(-1, 1).expand(-1, w)
-            x = torch.linspace(0, 1, w).view(1, -1).expand(h, -1)
-            
-            # Initialize value with distance pattern
-            dist = torch.sqrt((x - 0.5)**2 + (y - 0.5)**2).clamp(0, 1)
-            self.value.copy_(dist)
-            
-            # Initialize palette weights for center region
-            self.tensor.zero_()
-            center_size = min(h, w) // 4
-            cy, cx = h//2, w//2
-            
-            # Assign different palette indices to different regions
-            for i in range(min(4, self.n_pallets)):
-                quadrant_y, quadrant_x = i // 2, i % 2
-                y_start = cy - center_size + quadrant_y * center_size
-                y_end = cy - center_size + (quadrant_y + 1) * center_size
-                x_start = cx - center_size + quadrant_x * center_size
-                x_end = cx - center_size + (quadrant_x + 1) * center_size
-                
-                y_start, y_end = max(0, y_start), min(h, y_end)
-                x_start, x_end = max(0, x_start), min(w, x_end)
-                
-                if y_end > y_start and x_end > x_start:
-                    self.tensor[i, y_start:y_end, x_start:x_end] = 1.0
-            
-            # Initialize alive mask in center
-            self.alive_mask.zero_()
-            self.alive_mask[0, cy-center_size:cy+center_size, cx-center_size:cx+center_size] = 1.0
-            
-            # Clear grad buffer
-            self.grad_buffer.zero_()
-    
-    def set_pallet_target(self, pil_image):
-        """Set target palette from image (like PixelImage)"""
-        if pil_image is None:
-            self.use_pallet_target = False
-            return
-        dummy = self.clone()
-        dummy.use_pallet_target = False
-        dummy.encode_image(pil_image)
-        with torch.no_grad():
-            self.pallet_target.copy_(dummy.sort_pallet())
-            self.pallet.copy_(self.pallet_target)
-            self.use_pallet_target = True
-    
-    @torch.no_grad()
-    def lock_pallet(self, lock=True):
-        """Lock the palette (like PixelImage)"""
-        if lock:
-            self.pallet_target.copy_(self.sort_pallet())
-        self.use_pallet_target = lock
-    
-    def image_loss(self):
-        """Return image-specific losses (like PixelImage)"""
-        return [x for x in [self.hdr_loss, self.loss] if x is not None]
-    
-    def sort_pallet(self):
-        """Sort the palette by brightness (like PixelImage)"""
-        if self.use_pallet_target:
-            return self.pallet_target
-        pallet = (self.pallet / self.pallet_inertia).clamp(0, 1)
-        # Calculate color norms for sorting
-        magic_color = pallet.new_tensor([[[0.299, 0.587, 0.114]]])
-        color_norms = pallet.square().mul(magic_color).sum(dim=-1)
-        # Optimized sorting using torch.gather
-        pallet_indices = color_norms.argsort(dim=0)
-        sorted_pallet = torch.gather(pallet, 0, pallet_indices.unsqueeze(-1).expand(-1, self.n_pallets, 3))
-        return sorted_pallet
+            clone.state.copy_(self.state)
+            clone.ca_model.load_state_dict(self.ca_model.state_dict())
+            clone.steps_per_update = self.steps_per_update
+            clone.use_target = self.use_target
+            if self.target_image is not None:
+                clone.target_image = self.target_image.clone()
+        return clone
     
     def get_image_tensor(self):
-        """Return tensor for transformations (like PixelImage)"""
-        return torch.cat([self.value.unsqueeze(0), self.tensor])
+        """Return the inner state tensor - required for transformations"""
+        return self.state.squeeze(0)
     
-    @torch.no_grad()
     def set_image_tensor(self, tensor):
-        """Set tensor from external source (like PixelImage)"""
-        self.value.copy_(tensor[0])
-        self.tensor.copy_(tensor[1:])
+        """Set the inner state tensor - required for transformations"""
+        with torch.no_grad():
+            self.state.copy_(tensor.unsqueeze(0))
     
     def decode_tensor(self):
-        """Convert to RGB tensor (like PixelImage, but simplified)"""
-        width, height = self.image_shape
-        pallet = self.sort_pallet()
+        """Convert the CA state to an RGB image tensor"""
+        # Extract RGBA channels and convert to RGB
+        rgba = self.state[0, :4]
+        rgb = rgba[:3]
+        alpha = rgba[3:4]
         
-        # Brightness values of pixels
-        values = self.value.clamp(0, 1) * (self.pallet_size - 1)
-        value_floors, value_ceils, value_rounds, value_fracs = break_tensor(values)
-        value_fracs = value_fracs.unsqueeze(-1).unsqueeze(-1)
+        # Premultiply RGB by alpha for compositing
+        rgb_out = (1.0 - alpha) + rgb
         
-        # Get palette weights using softmax for smooth blending
-        pallet_weights = self.tensor.movedim(0, 2)
-        pallet_weights = F.softmax(pallet_weights, dim=2).unsqueeze(-1)
-        
-        # Get colors based on brightness values
-        colors_cont = pallet[value_floors] * (1 - value_fracs) + pallet[value_ceils] * value_fracs
-        colors_cont = (colors_cont * pallet_weights).sum(dim=2)
-        
-        # Resize to final dimensions
-        colors_cont = F.interpolate(
-            colors_cont.permute(2, 0, 1).unsqueeze(0),
-            size=(height, width),
-            mode='nearest'
-        ).squeeze(0)
-        
-        return colors_cont
+        return rgb_out
     
     def encode_image(self, pil_image, smart_encode=True, device=DEVICE):
-        """Encode from PIL image with palette (like PixelImage)"""
-        width, height = self.image_shape
+        """Set a target image for the CA to grow towards"""
+        # Convert PIL image to tensor
+        img_tensor = TF.to_tensor(pil_image).to(device)
         
-        # Resize and convert to tensor
-        scale = self.scale
-        color_ref = pil_image.resize((width // scale, height // scale), Image.LANCZOS)
-        color_ref = TF.to_tensor(color_ref).to(device)
+        # Resize to match our dimensions
+        h, w = self.state.shape[2:]
+        if img_tensor.shape[1] != h or img_tensor.shape[2] != w:
+            img_tensor = F.interpolate(
+                img_tensor.unsqueeze(0),
+                size=(h, w),
+                mode='bilinear',
+                align_corners=False
+            ).squeeze(0)
         
-        # Calculate grayscale values for brightness
-        with torch.no_grad():
-            magic_color = torch.tensor([0.299, 0.587, 0.114], device=device).view(3, 1, 1)
-            value_ref = (color_ref * magic_color).sum(dim=0)
-            self.value.copy_(value_ref)
-            
-            # Initialize alive mask based on brightness
-            self.alive_mask[0] = (value_ref > value_ref.mean() * 0.8).float()
+        # Store as target
+        self.target_image = img_tensor
+        self.use_target = True
         
+        # Reset CA state to a seed
+        self.reset_state()
+        
+        # If smart_encode, pre-train the CA to approach the target
         if smart_encode:
-            # Skip optimization for simplicity and just assign random palette weights
-            with torch.no_grad():
-                # Find areas with different colors
-                mean_color = color_ref.mean(dim=(1, 2), keepdim=True)
-                diff_color = (color_ref - mean_color).abs().sum(dim=0)
-                
-                # Create different regions based on color differences
-                regions = (diff_color > diff_color.mean()).float()
-                
-                # Assign palette weights based on regions
-                k_means = min(4, self.n_pallets)
-                h, w = self.tensor.shape[1:]
-                for i in range(k_means):
-                    # Create mask for this region (simple grid-based division)
-                    region_y, region_x = i // 2, i % 2
-                    y_start = region_y * (h // 2)
-                    y_end = (region_y + 1) * (h // 2)
-                    x_start = region_x * (w // 2)
-                    x_end = (region_x + 1) * (w // 2)
-                    
-                    # Set weights higher in this region
-                    self.tensor[i, y_start:y_end, x_start:x_end] = 5.0
+            self.pretrain_ca(steps=100)
     
-    def encode_random(self, random_pallet=False):
-        """Initialize with random values (like PixelImage)"""
-        with torch.no_grad():
-            self.value.uniform_()
-            self.tensor.uniform_()
-            if random_pallet:
-                self.pallet.uniform_(to=self.pallet_inertia)
+    def pretrain_ca(self, steps=100):
+        """Pre-train the CA to grow towards the target image"""
+        if not self.use_target or self.target_image is None:
+            return
             
-            # Initialize alive mask with random connected regions
-            h, w = self.value.shape
-            noise = torch.randn(h//4, w//4, device=self.value.device)
-            noise = F.interpolate(noise.unsqueeze(0).unsqueeze(0), size=(h, w), mode='bicubic').squeeze(0)
-            self.alive_mask[0] = (noise > noise.mean()).float()
-            self.alive_mask = F.max_pool2d(self.alive_mask, 5, stride=1, padding=2)
-    
-    def set_steps_per_update(self, steps):
-        """Set animation speed"""
-        self.steps_per_update = steps
-    
-    def set_update_mode(self, mode):
-        """Set animation style"""
-        if mode in ['grow', 'none']:
-            self.update_mode = mode
+        # Create optimizer for CA parameters
+        optimizer = optim.Adam(self.ca_model.parameters(), lr=2e-3)
+        
+        # Pre-training loop
+        for _ in range(steps):
+            # Run multiple CA steps
+            x = self.state.clone()
+            for _ in range(8):  # Run multiple steps for each optimization step
+                x = self.ca_model(x)
+            
+            # Calculate loss against target
+            rgb = x[0, :3]
+            target_rgb = self.target_image[:3]
+            loss = F.mse_loss(rgb, target_rgb)
+            
+            # Update parameters
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            
+            # Update state
+            with torch.no_grad():
+                self.state.copy_(x.detach())
     
     @torch.no_grad()
     def update(self):
-        """Update the image with CA growth"""
-        # First update palette parameters like PixelImage
-        self.pallet.copy_(self.pallet.clamp(0, self.pallet_inertia))
-        self.value.copy_(self.value.clamp(0, 1))
-        self.tensor.copy_(self.tensor.clamp(0, float('inf')))
-        
-        if self.update_mode == 'none':
-            return
-            
-        # Store gradients if available
-        if self.tensor.grad is not None:
-            self.grad_buffer.copy_(self.tensor.grad)
-            self.tensor.grad.zero_()
-            
-        # Run CA growth steps
+        """Run CA steps to update the state"""
         for _ in range(self.steps_per_update):
-            if self.update_mode == 'grow':
-                # 1. Save current alive mask
-                prev_alive = self.alive_mask.clone()
-                
-                # 2. Calculate growth probability
-                neighbors = F.avg_pool2d(self.alive_mask, kernel_size=3, stride=1, padding=1)
-                growth_prob = neighbors * (1 - self.alive_mask)
-                
-                # 3. Grow mask with randomness
-                rand_mask = torch.rand_like(growth_prob) < growth_prob * 0.3
-                new_alive = self.alive_mask + rand_mask.float() * 0.5
-                
-                # 4. Never decrease alive mask
-                self.alive_mask = torch.maximum(new_alive, prev_alive)
-                
-                # 5. Update palette weights (tensor) in alive regions
-                # Get the current palette distribution
-                weights = F.softmax(self.tensor, dim=0)
-                
-                # Apply diffusion to weights
-                kernel = torch.ones(1, 1, 3, 3, device=self.tensor.device) / 9.0
-                diffused_weights = torch.zeros_like(weights)
-                
-                for i in range(self.n_pallets):
-                    channel = weights[i:i+1].unsqueeze(0)
-                    diffused = F.conv2d(channel, kernel, padding=1)
-                    diffused_weights[i] = diffused.squeeze(0)
-                
-                # Convert back to logits for the tensor
-                diffused_tensor = torch.log(diffused_weights.clamp(min=1e-6))
-                
-                # Only update in alive regions
-                alive_expanded = self.alive_mask.expand_as(self.tensor)
-                self.tensor.copy_(
-                    self.tensor * (1 - alive_expanded) + 
-                    diffused_tensor * alive_expanded
-                )
-                
-                # 6. Update brightness values with smoother gradients
-                value_kernel = torch.ones(3, 3, device=self.value.device) / 9.0
-                diffused_value = F.conv2d(
-                    self.value.unsqueeze(0).unsqueeze(0), 
-                    value_kernel.unsqueeze(0).unsqueeze(0), 
-                    padding=1
-                ).squeeze(0).squeeze(0)
-                
-                # Apply to alive regions
-                alive_mask_2d = self.alive_mask.squeeze(0)
-                self.value.copy_(
-                    self.value * (1 - alive_mask_2d) + 
-                    diffused_value * alive_mask_2d
-                )
-    
-    @torch.no_grad()
-    def render_value_image(self):
-        """Render value image for visualization (like PixelImage)"""
-        width, height = self.image_shape
-        values = self.value.clamp(0, 1).unsqueeze(-1).repeat(1, 1, 3)
-        array = (values.mul(255).clamp(0, 255).cpu().numpy().astype(np.uint8))
-        return Image.fromarray(array).resize((width, height), Image.NEAREST)
-    
-    @torch.no_grad()
-    def render_pallet(self):
-        """Render palette for visualization (like PixelImage)"""
-        pallet = self.sort_pallet()
-        width, height = self.n_pallets * 16, self.pallet_size * 32
-        array = (pallet.mul(255).clamp(0, 255).cpu().numpy().astype(np.uint8))
-        return Image.fromarray(array).resize((width, height), Image.NEAREST)
+            self.state.copy_(self.ca_model(self.state))
     
     @torch.no_grad()
     def decode_image(self):
@@ -460,3 +218,24 @@ class GNCAImage(DifferentiableImage):
         tensor = self.decode_tensor()
         array = (tensor.permute(1, 2, 0).mul(255).clamp(0, 255).cpu().numpy().astype(np.uint8))
         return Image.fromarray(array)
+    
+    def set_steps_per_update(self, steps):
+        """Set how many CA steps to run per update"""
+        self.steps_per_update = steps
+    
+    # Additional methods to maintain compatibility with PixelImage
+    def image_loss(self):
+        """Return empty list for compatibility"""
+        return []
+    
+    def set_pallet_target(self, pil_image):
+        """Compatibility method"""
+        if pil_image is not None:
+            self.encode_image(pil_image)
+        else:
+            self.use_target = False
+    
+    @torch.no_grad()
+    def lock_pallet(self, lock=True):
+        """Compatibility method"""
+        pass 
