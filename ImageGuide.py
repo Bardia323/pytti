@@ -3,6 +3,8 @@ from pytti.Notebook import tqdm
 from pytti import *
 import pandas as pd
 import math
+import inspect
+import torch
 
 from labellines import labelLines
 from scipy.signal import savgol_filter
@@ -337,7 +339,17 @@ class EnhancedImageGuide(DirectImageGuide):
                     new_weight = max(min(new_weight, init_weight_val * 5.0), init_weight_val * 0.2)
                     
                     try:
-                        prompt.set_weight(new_weight)
+                        # Check if the weight needs to be an integer
+                        if hasattr(prompt.weight, 'dtype') and prompt.weight.dtype == torch.int64:
+                            new_weight = int(new_weight)
+                        
+                        # Check if set_weight needs device parameter
+                        import inspect
+                        sig = inspect.signature(prompt.set_weight)
+                        if len(sig.parameters) == 1:
+                            prompt.set_weight(new_weight)
+                        else:
+                            prompt.set_weight(new_weight, DEVICE)
                     except Exception as e:
                         print(f"Warning: Could not set weight for {prompt}: {e}")
         
@@ -368,7 +380,17 @@ class EnhancedImageGuide(DirectImageGuide):
                     new_weight = max(min(new_weight, init_weight_val * 5.0), init_weight_val * 0.2)
                     
                     try:
-                        aug.set_weight(new_weight)
+                        # Check if the weight needs to be an integer
+                        if hasattr(aug.weight, 'dtype') and aug.weight.dtype == torch.int64:
+                            new_weight = int(new_weight)
+                        
+                        # Check if set_weight needs device parameter
+                        import inspect
+                        sig = inspect.signature(aug.set_weight)
+                        if len(sig.parameters) == 1:
+                            aug.set_weight(new_weight)
+                        else:
+                            aug.set_weight(new_weight, DEVICE)
                     except Exception as e:
                         print(f"Warning: Could not set weight for {aug}: {e}")
     
