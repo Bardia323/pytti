@@ -21,9 +21,9 @@ class Loss(nn.Module):
   def set_enabled(self, enabled):
     self.enabled = enabled
 
-  def set_weight(weight):
+  def set_weight(self, weight):
     self.weight = weight
-  def set_stop(stop):
+  def set_stop(self, stop):
     self.stop = stop
 
   def __str__(self):
