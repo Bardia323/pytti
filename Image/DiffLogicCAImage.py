@@ -425,11 +425,61 @@ class DiffLogicCAImage(DifferentiableImage):
         Integration with Pytti's training loop.
         This method is called by the DirectImageGuide to update the image based on prompts.
         """
-        # Run a CA step (normal optimizer would update pixels here)
-        self.step(hard=False)  # Use soft logic during training
+        # Get the current image tensor
+        z = self.get_image_tensor()
         
-        # Return a dummy loss for Pytti's benefit
-        losses = {'TOTAL': 0.0}
+        # Calculate losses from prompts (CLIP guidance)
+        losses = {}
+        total_loss = 0
+        
+        # Process each prompt
+        for prompt in prompts:
+            # Format inputs for this prompt
+            formatted_inputs = {
+                'embeds': None,
+                'offsets': None,
+                'sizes': None
+            }
+            
+            # Calculate loss for this prompt
+            loss = prompt(z)
+            losses[prompt] = loss
+            total_loss += loss
+        
+        # Process loss augmentations
+        for aug in loss_augs:
+            aug_loss = aug(z)
+            losses[aug] = aug_loss
+            total_loss += aug_loss
+        
+        # Store total loss
+        losses['TOTAL'] = total_loss
+        
+        # Now use the loss to guide the CA evolution
+        # We'll adjust the CA state based on the gradient of the loss
+        if total_loss > 0:
+            # Calculate gradients
+            total_loss.backward()
+            
+            # Use gradients to influence the CA state
+            # This is the key part - we're using the CLIP loss to guide the CA
+            with torch.no_grad():
+                # Get gradients for the RGB channels
+                grad = self.state.grad
+                if grad is not None:
+                    # Scale gradients to influence CA state
+                    # Focus on RGB channels (first 3)
+                    rgb_grad = grad[..., :self.rgb_channels]
+                    
+                    # Apply gradient influence (small step)
+                    influence = 0.01
+                    self.state.data[..., :self.rgb_channels] -= influence * rgb_grad
+                    
+                    # Zero gradients for next step
+                    self.state.grad.zero_()
+        
+        # Run a CA step after applying gradient influence
+        self.step(hard=False)  # Use soft logic during training
         
         return losses
 
