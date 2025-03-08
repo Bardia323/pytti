@@ -100,7 +100,8 @@ class PixelImage(DifferentiableImage):
     def __init__(self, width, height, scale, pallet_size, n_pallets, gamma=1, hdr_weight=0.5, norm_weight=0.1, device=DEVICE):
         super().__init__(width * scale, height * scale)
         self.pallet_inertia = 2
-        pallet = torch.linspace(0, self.pallet_inertia, pallet_size).pow(gamma).view(pallet_size, 1, 1).repeat(1, n_pallets, 3)
+        # Initialize palette with gamma=1 (no correction) initially
+        pallet = torch.linspace(0, self.pallet_inertia, pallet_size).view(pallet_size, 1, 1).repeat(1, n_pallets, 3)
         self.pallet = nn.Parameter(pallet.to(device, dtype=torch.float32))  # Use float32 for stability
         self.pallet_size = pallet_size
         self.n_pallets = n_pallets
@@ -109,10 +110,14 @@ class PixelImage(DifferentiableImage):
         self.output_axes = ('n', 's', 'y', 'x')
         self.latent_strength = 0.1
         self.scale = scale
-        self.hdr_loss = HdrLoss(pallet_size, n_pallets, gamma, hdr_weight) if hdr_weight != 0 else None
+        self.hdr_loss = HdrLoss(pallet_size, n_pallets, 1.0, hdr_weight) if hdr_weight != 0 else None
         self.loss = PalletLoss(n_pallets, norm_weight)
         self.register_buffer('pallet_target', torch.empty_like(self.pallet))
         self.use_pallet_target = False
+        # Store target gamma for gradual application
+        self.target_gamma = gamma
+        self.current_gamma = 1.0
+        self.gamma_step = 0.01  # How quickly to approach target gamma
 
     def clone(self):
         width, height = self.image_shape
@@ -172,6 +177,12 @@ class PixelImage(DifferentiableImage):
         width, height = self.image_shape
         pallet = self.sort_pallet()
 
+        # Apply current gamma to the palette during decoding
+        gamma_corrected_pallet = pallet
+        if self.current_gamma != 1.0:
+            # Apply gamma correction to palette values
+            gamma_corrected_pallet = pallet.pow(self.current_gamma)
+
         # Brightness values of pixels
         values = self.value.clamp(0, 1) * (self.pallet_size - 1)
         value_floors, value_ceils, value_rounds, value_fracs = break_tensor(values)
@@ -184,7 +195,7 @@ class PixelImage(DifferentiableImage):
         pallet_weights = F.softmax(pallet_weights, dim=2).unsqueeze(-1)
         pallets = pallets.unsqueeze(-1)
 
-        colors_disc = pallet[value_rounds]
+        colors_disc = gamma_corrected_pallet[value_rounds]
         colors_disc = (colors_disc * pallets).sum(dim=2)
         colors_disc = F.interpolate(
             colors_disc.permute(2, 0, 1).unsqueeze(0).contiguous(),
@@ -192,7 +203,7 @@ class PixelImage(DifferentiableImage):
             mode='nearest'
         )
 
-        colors_cont = pallet[value_floors] * (1 - value_fracs) + pallet[value_ceils] * value_fracs
+        colors_cont = gamma_corrected_pallet[value_floors] * (1 - value_fracs) + gamma_corrected_pallet[value_ceils] * value_fracs
         colors_cont = (colors_cont * pallet_weights).sum(dim=2)
         colors_cont = F.interpolate(
             colors_cont.permute(2, 0, 1).unsqueeze(0).contiguous(),
@@ -247,9 +258,15 @@ class PixelImage(DifferentiableImage):
 
     @torch.no_grad()
     def update(self):
+        # Gradually adjust gamma towards target
+        if self.current_gamma < self.target_gamma:
+            self.current_gamma = min(self.current_gamma + self.gamma_step, self.target_gamma)
+            if self.hdr_loss is not None:
+                self.hdr_loss.gamma = self.current_gamma
         self.pallet.copy_(self.pallet.clamp(0, self.pallet_inertia))
         self.value.copy_(self.value.clamp(0, 1))
         self.tensor.copy_(self.tensor.clamp(0, float('inf')))
+        return self.get_image_tensor()
 
     def encode_image_old(self, pil_image, smart_encode=True, device=DEVICE):
         width, height = self.image_shape
