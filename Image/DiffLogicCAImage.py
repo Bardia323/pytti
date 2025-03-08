@@ -9,6 +9,9 @@ from PIL import Image, ImageOps
 import types
 import sys
 
+# Create a special flag at the module level
+ANIMATION_MODE = "None"
+
 class LogicGate(nn.Module):
     """
     Differentiable logic gate as described in the DiffLogic CA paper.
@@ -597,14 +600,58 @@ class DiffLogicCAImage(DifferentiableImage):
 def init_difflogic_ca(animation_mode="None"):
     """
     Initialize DiffLogicCA system.
-    This function applies special handling for different animation modes.
+    Store the animation mode globally to use when creating model instances.
     
     Args:
         animation_mode: The animation mode being used ("None", "2D", "3D", "Video Source")
     """
+    global ANIMATION_MODE
+    ANIMATION_MODE = animation_mode
     print(f"DiffLogicCA system initialized with animation mode: {animation_mode}")
     
-    # No need for special patching anymore - we handle it in the class
-    print(f"Using DiffLogicCA with {animation_mode} mode")
+    # Warning for 3D mode
+    if animation_mode == "3D":
+        print("WARNING: 3D mode is not fully supported with DiffLogicCA.")
+        print("It will automatically fallback to 2D animation mode.")
     
-    return True 
+    return True
+
+# This function acts as a factory to create the right model based on animation mode
+def create_difflogic_model(width, height, ca_channels=8, rgb_channels=3, perception_kernels=16, steps=20, device=DEVICE):
+    """
+    Factory function to create the appropriate DiffLogicCA model based on animation mode.
+    """
+    global ANIMATION_MODE
+    
+    if ANIMATION_MODE == "3D":
+        # For 3D mode, create a 2D-compatible model with a warning
+        print("Creating DiffLogicCA with 2D compatibility instead of 3D")
+        return DiffLogicCAImage2D(width, height, ca_channels, rgb_channels, perception_kernels, steps, device)
+    else:
+        # For other modes, use the standard model
+        return DiffLogicCAImage(width, height, ca_channels, rgb_channels, perception_kernels, steps, device)
+
+# Create a simpler 2D-only version that doesn't try to use depth features
+class DiffLogicCAImage2D(DiffLogicCAImage):
+    """
+    A version of DiffLogicCA that's compatible with 2D animation only.
+    This will be used as a fallback when 3D mode is selected.
+    """
+    def __init__(self, width, height, ca_channels=8, rgb_channels=3, perception_kernels=16, steps=20, device=DEVICE):
+        super().__init__(width, height, ca_channels, rgb_channels, perception_kernels, steps, device)
+        print("Using 2D-compatible DiffLogicCA model (3D animations disabled)")
+        
+    # Override methods that might be called in 3D mode
+    def get_depth(self, *args, **kwargs):
+        # Don't return a real depth map - this will prevent 3D processing
+        print("Depth requested but not supported in 2D mode")
+        h, w = self.height, self.width
+        return np.zeros((h, w), dtype=np.float32), False
+    
+    def get_latent_tensor(self, detach=False):
+        # Return a tensor that won't be used for 3D processing
+        print("Latent requested but using 2D mode")
+        tensor = self.decode_tensor().unsqueeze(0)
+        if detach:
+            return tensor.detach()
+        return tensor 
