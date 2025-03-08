@@ -352,48 +352,27 @@ class DiffLogicCAImage(DifferentiableImage):
         self.state[..., :self.rgb_channels] = rgb
     
     def step(self, hard=False):
-        """Minimal CA rules - mostly just apply CLIP guidance directly"""
-        # This function now does very little - just small random perturbations
-        # The real optimization happens in the train() method
-        height, width, channels = self.state.shape
-        
+        """Do almost nothing - just add tiny noise for exploration"""
+        # This function now does almost nothing - just add minimal noise
+        # All real optimization happens in train()
         with torch.no_grad():
-            # Create small random variations to allow exploration
-            noise = (torch.rand_like(self.state) - 0.5) * 0.01
-            
-            # Apply minimal smoothing between neighbors for slight coherence
-            padded = F.pad(self.state.permute(2, 0, 1), [1, 1, 1, 1], mode='replicate')
-            kernel = torch.ones(1, 1, 3, 3, device=self.device)
-            kernel[0, 0, 1, 1] = 8.0  # Center pixel is 8x more important
-            kernel = kernel / kernel.sum()  # Normalize
-            
-            new_state = torch.zeros_like(self.state)
-            
-            for c in range(channels):
-                channel = padded[c:c+1].unsqueeze(0)
-                neighbors = F.conv2d(channel, kernel, padding=0)[0, 0]
-                
-                # 95% current state, 5% neighbor influence
-                new_state[..., c] = self.state[..., c] * 0.95 + neighbors * 0.05
-            
-            # Add noise to allow exploration
-            new_state = (new_state + noise).clamp(0, 1)
-        
-        self.state = nn.Parameter(new_state)
+            # Just add tiny noise (0.5%) to allow some exploration
+            noise = (torch.rand_like(self.state) - 0.5) * 0.005
+            self.state.data = (self.state.data + noise).clamp(0, 1)
     
     def run_ca(self, steps=None, hard=False):
-        """Run CA for multiple steps"""
+        """
+        Run CLIP optimization for multiple steps.
+        CA behavior is completely removed - this just adds noise now.
+        """
         if steps is None:
             steps = self.steps
         
-        # Use torch.no_grad for inference if not training
-        if not self.training and not hard:
+        for _ in range(steps):
+            # Just add minimal exploration noise
             with torch.no_grad():
-                for _ in range(steps):
-                    self.step(hard)
-        else:
-            for _ in range(steps):
-                self.step(hard)
+                noise = (torch.rand_like(self.state) - 0.5) * 0.01
+                self.state.data = (self.state.data + noise).clamp(0, 1)
     
     @torch.no_grad()
     def update(self):
@@ -525,8 +504,8 @@ class DiffLogicCAImage(DifferentiableImage):
 
     def train(self, i, prompts, interp_prompts, loss_augs, interp_steps=0):
         """
-        Direct CLIP guidance for each pixel.
-        This method is called by the DirectImageGuide to optimize pixels directly.
+        Direct CLIP guidance for each pixel - AGGRESSIVE VERSION.
+        Each pixel directly minimizes CLIP loss with no CA behavior.
         """
         # Get the current image tensor
         z = self.get_image_tensor()
@@ -551,51 +530,53 @@ class DiffLogicCAImage(DifferentiableImage):
         # Store total loss
         losses['TOTAL'] = total_loss
         
-        # Now use the loss to guide the state evolution - this is the key part
+        # Print loss value for debugging
+        if i % 10 == 0:
+            print(f"CLIP Loss at step {i}: {total_loss.item()}")
+        
+        # Now use the loss to guide each pixel directly - this is the key part
         if total_loss > 0:
             # Calculate gradients
             total_loss.backward()
             
-            # Apply gradients directly to update pixels
+            # Apply gradients directly with AGGRESSIVE learning rates
             with torch.no_grad():
                 grad = self.state.grad
                 if grad is not None:
-                    # Per-pixel learning rates
-                    # Adaptive learning rate based on iteration
-                    base_lr = 0.05 * (1.0 / (1.0 + i * 0.01))  # Decay over time
+                    # Fixed high learning rate - no decay
+                    base_lr = 0.2
                     
-                    # Apply more changes to pixels with stronger gradients
+                    # Apply changes directly proportional to gradient strength
                     grad_strength = grad.abs()
-                    # Normalize gradient strength to [0,1] range
+                    
+                    # Normalize gradient strength
                     if grad_strength.max() > 0:
-                        grad_strength = grad_strength / grad_strength.max()
+                        # Print max gradient for debugging
+                        if i % 10 == 0:
+                            print(f"Max gradient: {grad_strength.max().item()}")
+                        
+                        # Apply STRONG updates to RGB channels
+                        for c in range(min(3, self.rgb_channels)):
+                            # Direct application of scaled gradients
+                            self.state.data[..., c] -= grad[..., c] * base_lr
+                        
+                        # Apply smaller updates to hidden channels if they exist
+                        if self.ca_channels > self.rgb_channels:
+                            for c in range(self.rgb_channels, self.ca_channels):
+                                self.state.data[..., c] -= grad[..., c] * base_lr * 0.5
                     
-                    # Apply gradient-based changes directly to each pixel
-                    for c in range(self.ca_channels):
-                        # Stronger learning rate for RGB channels
-                        channel_lr = base_lr
-                        if c >= self.rgb_channels:
-                            channel_lr *= 0.5  # Lower learning rate for hidden channels
-                        
-                        # Apply gradient with per-pixel strength
-                        px_updates = -grad[..., c] * channel_lr * (1.0 + grad_strength[..., c] * 2.0)
-                        
-                        # Add randomness to some pixels for exploration
-                        explore_mask = (torch.rand_like(px_updates) < 0.05)  # 5% of pixels
-                        explore_values = (torch.rand_like(px_updates) - 0.5) * 0.1
-                        px_updates = torch.where(explore_mask, explore_values, px_updates)
-                        
-                        # Apply the updates
-                        self.state.data[..., c] += px_updates
-                    
-                    # Clamp values to valid range
+                    # Ensure values stay in proper range
                     self.state.data.clamp_(0, 1)
                     
                     # Zero gradients for next step
                     self.state.grad.zero_()
         
-        # Apply minimal CA rules to maintain some spatial coherence
-        self.step(hard=False)
+        # NO CA step - completely removed CA behavior
+        # Just add minimal noise for exploration
+        with torch.no_grad():
+            noise = (torch.rand_like(self.state) - 0.5) * 0.01
+            mask = torch.rand_like(self.state) < 0.1  # Only apply to 10% of pixels
+            self.state.data = torch.where(mask, self.state.data + noise, self.state.data).clamp(0, 1)
         
         return losses
 
