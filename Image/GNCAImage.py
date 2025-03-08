@@ -18,11 +18,11 @@ class GNCAImage(DifferentiableImage):
         super().__init__(width, height)
         self.scale = scale
         
-        # Create tensor with batch dimension [batch, channels, height, width]
-        self.tensor = nn.Parameter(torch.zeros(1, 3, height, width, device=DEVICE))
+        # Create tensor in RGB format
+        self.tensor = nn.Parameter(torch.zeros(3, height, width, device=DEVICE))
         
-        # CRITICAL: Set output_axes to match what the embedder expects
-        self.output_axes = ('n', 'c', 'y', 'x')
+        # CRITICAL: Match the exact axes format from DifferentiableImage
+        self.output_axes = ('s', 'y', 'x')  # This matches what named_rearrange expects
         
         # Animation parameters
         self.steps_per_update = 1
@@ -37,48 +37,24 @@ class GNCAImage(DifferentiableImage):
             self.tensor.zero_()
             
             # Get dimensions
-            _, _, h, w = self.tensor.shape
+            c, h, w = self.tensor.shape
             
             # Create pattern - circular gradient
             y = torch.linspace(-1, 1, h).view(-1, 1).expand(-1, w)
             x = torch.linspace(-1, 1, w).view(1, -1).expand(h, -1)
             
             # Create circular distance from center
-            dist = torch.sqrt(x.pow(2) + y.pow(2))
+            dist = torch.sqrt(x.pow(2) + y.pow(2)).clamp(0, 1)
             
-            # Create interesting patterns
-            r = torch.sin(dist * 6.28) * 0.5 + 0.5  # Red channel
-            g = torch.sin(dist * 6.28) * 0.5 + 0.5  # Green channel
-            b = torch.sin(dist * 6.28) * 0.5 + 0.5  # Blue channel
+            # Create colorful pattern
+            r = 0.5 + 0.5 * torch.cos(dist * 3.14159 * 3)
+            g = 0.5 + 0.5 * torch.sin(dist * 3.14159 * 4)
+            b = 0.5 + 0.5 * torch.cos(dist * 3.14159 * 5 + 3.14159/2)
             
-            # Assign to tensor (keeping NCHW format)
-            self.tensor[0, 0] = r
-            self.tensor[0, 1] = g
-            self.tensor[0, 2] = b
-    
-    def set_steps_per_update(self, steps):
-        """Set animation speed"""
-        self.steps_per_update = steps
-    
-    @torch.no_grad()
-    def update(self):
-        """Add subtle animation"""
-        # Additional animation effects
-        for _ in range(self.steps_per_update):
-            # Apply a simple blur for movement
-            kernel_size = 3
-            kernel = torch.ones(1, 1, kernel_size, kernel_size, device=self.tensor.device) / (kernel_size ** 2)
-            
-            # Process each channel
-            for i in range(3):
-                # Ensure correct shape with batch dimension
-                channel = self.tensor[:, i:i+1]
-                # Apply blur
-                blurred = F.conv2d(channel, kernel, padding=kernel_size//2)
-                # Add noise
-                noise = torch.randn_like(blurred) * 0.01
-                # Update tensor
-                self.tensor[:, i:i+1] = (blurred + noise).clamp(0, 1)
+            # Set tensor values
+            self.tensor[0] = r  # Red
+            self.tensor[1] = g  # Green
+            self.tensor[2] = b  # Blue
     
     def clone(self):
         """Create a clone of this image"""
@@ -90,16 +66,25 @@ class GNCAImage(DifferentiableImage):
         return clone
     
     def decode_tensor(self):
-        """Convert to RGB tensor"""
-        return self.tensor[0]  # Return [C, H, W] format
+        """Returns tensor in the expected output format"""
+        return self.tensor
+    
+    def get_image_tensor(self):
+        """Return tensor for transformations"""
+        return self.tensor
+    
+    def set_image_tensor(self, tensor):
+        """Set from tensor"""
+        with torch.no_grad():
+            self.tensor.copy_(tensor)
     
     def encode_image(self, pil_image, smart_encode=True, device=DEVICE):
         """Set from target image"""
         # Convert PIL image to tensor
         img_tensor = TF.to_tensor(pil_image).to(device)
         
-        # Resize to match our dimensions
-        h, w = self.tensor.shape[2:]
+        # Resize if needed
+        c, h, w = self.tensor.shape
         if img_tensor.shape[1] != h or img_tensor.shape[2] != w:
             img_tensor = F.interpolate(
                 img_tensor.unsqueeze(0),
@@ -108,18 +93,49 @@ class GNCAImage(DifferentiableImage):
                 align_corners=False
             ).squeeze(0)
         
-        # Set tensor directly - keeping the batch dimension
+        # Set tensor
         with torch.no_grad():
-            self.tensor[0].copy_(img_tensor)
+            self.tensor.copy_(img_tensor)
+    
+    def encode_random(self):
+        """Fill with random data"""
+        with torch.no_grad():
+            self.tensor.uniform_().mul_(0.1).add_(0.5)
+    
+    def set_steps_per_update(self, steps):
+        """Set animation speed"""
+        self.steps_per_update = steps
     
     @torch.no_grad()
-    def decode_image(self):
-        """Convert to PIL image for display"""
-        tensor = self.tensor[0]  # Remove batch dimension
-        array = (tensor.permute(1, 2, 0).mul(255).clamp(0, 255).cpu().numpy().astype(np.uint8))
-        return Image.fromarray(array)
+    def update(self):
+        """Run animation effect"""
+        for _ in range(self.steps_per_update):
+            # Apply cellular automata-like update
+            # 1. Get a blurred version of the image
+            kernel_size = 3
+            kernel = torch.ones(1, 1, kernel_size, kernel_size, device=self.tensor.device) / (kernel_size**2)
+            
+            # Apply convolution to each channel separately
+            channels = []
+            for i in range(3):
+                channel = self.tensor[i:i+1].unsqueeze(0)  # Add batch dim
+                blurred = F.conv2d(channel, kernel, padding=kernel_size//2)
+                channels.append(blurred.squeeze(0))
+            
+            # Combine channels with slight variations to create movement
+            r = channels[0] * 0.9 + channels[1] * 0.1
+            g = channels[1] * 0.9 + channels[2] * 0.1
+            b = channels[2] * 0.9 + channels[0] * 0.1
+            
+            # Add noise
+            noise = torch.randn_like(self.tensor) * 0.01
+            
+            # Update tensor
+            self.tensor[0:1] = (r + noise[0:1]).clamp(0, 1)
+            self.tensor[1:2] = (g + noise[1:2]).clamp(0, 1)
+            self.tensor[2:3] = (b + noise[2:3]).clamp(0, 1)
     
-    # Methods needed for compatibility
+    # Required for compatibility
     def image_loss(self):
         return []
     
