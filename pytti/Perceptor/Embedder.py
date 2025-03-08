@@ -1,10 +1,11 @@
 def forward(self, diff_image, input, device):
+    side_x, side_y = diff_image.shape[2:]
     if input is None:
         input = format_module(diff_image, self).to(device=device)
     else:
         input = format_input(input, diff_image, self).to(device=device)
     
-    # Only apply channels_last if tensor has rank 4
+    # Only apply channels_last if tensor has 4 dimensions
     if input.dim() == 4:
         input = input.to(memory_format=torch.channels_last)
     elif input.dim() < 4:
