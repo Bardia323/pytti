@@ -175,9 +175,11 @@ class EnhancedImageGuide(DirectImageGuide):
     Enhanced version of DirectImageGuide with support for:
     1. Multiple optimizer types (Adam, AdamW, RAdam, Lookahead)
     2. Adaptive loss weighting
+    3. Progressive growing for faster optimization
     """
     def __init__(self, image_rep, embedder, optimizer_name='adam', lr=None, adaptive_weights=False, 
-                 weight_update_freq=10, weight_scale_factor=0.5, **optimizer_params):
+                 weight_update_freq=10, weight_scale_factor=0.5, progressive_growing=False,
+                 start_resolution_scale=0.25, final_resolution_steps=1000, resolution_delay=0, **optimizer_params):
         """
         image_rep: The image representation to optimize
         embedder: The embedder to use for image-text comparison
@@ -186,6 +188,10 @@ class EnhancedImageGuide(DirectImageGuide):
         adaptive_weights: Whether to use adaptive loss weighting
         weight_update_freq: How often to update loss weights (in steps)
         weight_scale_factor: How strongly to adjust weights (0-1)
+        progressive_growing: Whether to use progressive growing
+        start_resolution_scale: Initial resolution scale factor (0.1-1.0)
+        final_resolution_steps: How many steps to reach final resolution
+        resolution_delay: How many steps to wait before starting resolution growth
         """
         self.image_rep = image_rep
         self.embedder = embedder
@@ -202,6 +208,16 @@ class EnhancedImageGuide(DirectImageGuide):
         self.weight_scale_factor = weight_scale_factor
         self.loss_history = {}
         self.initial_weights = {}
+        
+        # Progressive growing parameters
+        self.progressive_growing = progressive_growing
+        self.start_resolution_scale = max(0.1, min(1.0, start_resolution_scale))  # Clamp between 0.1 and 1.0
+        self.final_resolution_steps = max(100, final_resolution_steps)  # At least 100 steps
+        self.resolution_delay = max(0, resolution_delay)
+        self.original_resolution = None
+        if self.progressive_growing:
+            self._store_original_resolution()
+            self._set_current_resolution(self.start_resolution_scale)
         
         # Create optimizer based on name
         self.optimizer_name = optimizer_name.lower()
@@ -402,8 +418,86 @@ class EnhancedImageGuide(DirectImageGuide):
         # Clear the list
         self.weights_to_update = []
     
+    def _store_original_resolution(self):
+        """Store the original resolution of the image representation"""
+        if hasattr(self.image_rep, 'width') and hasattr(self.image_rep, 'height'):
+            self.original_resolution = (self.image_rep.width, self.image_rep.height)
+        elif hasattr(self.image_rep, 'size'):
+            self.original_resolution = self.image_rep.size
+        else:
+            # Can't determine resolution, disable progressive growing
+            print("Warning: Couldn't determine image representation resolution, disabling progressive growing")
+            self.progressive_growing = False
+    
+    def _set_current_resolution(self, scale_factor):
+        """Set the current resolution of the image representation"""
+        if not self.original_resolution:
+            return
+            
+        if hasattr(self.image_rep, 'width') and hasattr(self.image_rep, 'height'):
+            new_width = max(32, int(self.original_resolution[0] * scale_factor))
+            new_height = max(32, int(self.original_resolution[1] * scale_factor))
+            
+            # Check if we need to update
+            if new_width != self.image_rep.width or new_height != self.image_rep.height:
+                old_size = (self.image_rep.width, self.image_rep.height)
+                self.image_rep.set_resolution(new_width, new_height)
+                print(f"Resolution changed from {old_size} to ({new_width}, {new_height})")
+                
+                # Need to recreate optimizer when tensor shapes change
+                self._create_optimizer()
+        
+        elif hasattr(self.image_rep, 'size') and hasattr(self.image_rep, 'set_size'):
+            new_size = max(32, int(self.original_resolution * scale_factor))
+            
+            # Check if we need to update
+            if new_size != self.image_rep.size:
+                old_size = self.image_rep.size
+                self.image_rep.set_size(new_size)
+                print(f"Resolution changed from {old_size} to {new_size}")
+                
+                # Need to recreate optimizer when tensor shapes change
+                self._create_optimizer()
+    
+    def _update_resolution(self, i):
+        """Update resolution based on current step"""
+        if not self.progressive_growing or i < self.resolution_delay:
+            return
+            
+        # Calculate progress (0 to 1) for resolution scaling
+        progress = min(1.0, (i - self.resolution_delay) / self.final_resolution_steps)
+        
+        # Exponential growth curve (smoother initial growth, faster towards end)
+        # This creates a more natural progression than linear
+        growth_factor = progress ** 0.5
+        
+        # Calculate current scale
+        current_scale = self.start_resolution_scale + (1.0 - self.start_resolution_scale) * growth_factor
+        
+        # Update resolution
+        self._set_current_resolution(current_scale)
+    
+    def reset_to_full_resolution(self):
+        """Reset to full resolution after training"""
+        if self.progressive_growing and self.original_resolution:
+            print("Resetting to full resolution for final output")
+            self._set_current_resolution(1.0)
+            # Run a few optimizer steps at full resolution to clean up
+            for _ in range(3):
+                self.optimizer.zero_grad()
+                z = self.image_rep.decode_training_tensor()
+                z = z.mean()  # Small dummy loss
+                z.backward()
+                self.optimizer.step()
+            self.image_rep.update()
+    
     def train(self, i, prompts, interp_prompts, loss_augs, interp_steps=0, save_loss=True):
-        """Performs a training step with adaptive weight adjustment."""
+        """Train for one step with progressive resolution growing"""
+        # Update resolution if using progressive growing
+        if self.progressive_growing:
+            self._update_resolution(i)
+            
+        # Continue with the original training logic
         self.optimizer.zero_grad()
         z = self.image_rep.decode_training_tensor()
 
@@ -499,3 +593,39 @@ class EnhancedImageGuide(DirectImageGuide):
         self.image_rep.update()
 
         return {'TOTAL': float(total_loss)}
+
+    def run_steps(self, n_steps, prompts, interp_prompts, loss_augs, stop=-math.inf, interp_steps=0, i_offset=0, skipped_steps=0):
+        """Runs n_steps of optimization with progressive growing"""
+        self.image_rep.init_optimizer(self.optimizer)
+        
+        pbar = tqdm(range(n_steps))
+        best_iter = 0
+        best_loss = float('inf')
+        losses = []
+        
+        for i in pbar:
+            actual_i = i + i_offset
+            
+            # Run one training step with potential resolution update
+            loss_dict = self.train(actual_i, prompts, interp_prompts, loss_augs, interp_steps, True)
+            
+            # Update progress bar
+            total_loss = loss_dict['TOTAL']
+            if total_loss < best_loss:
+                best_loss = total_loss
+                best_iter = i
+            losses.append(total_loss)
+            pbar.set_description(f"Loss: {total_loss:.4f}, Best: {best_loss:.4f} @ {best_iter}/{skipped_steps}")
+            
+            # Check if we should stop early
+            if len(losses) > 50:
+                avg_loss = sum(losses[-10:]) / 10
+                if avg_loss < stop:
+                    print(f"Stopping early at iteration {i}, loss {avg_loss:.4f} < {stop:.4f}")
+                    break
+        
+        # Reset to full resolution for final output if using progressive growing
+        if self.progressive_growing:
+            self.reset_to_full_resolution()
+            
+        return best_loss, best_iter
