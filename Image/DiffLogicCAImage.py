@@ -88,13 +88,7 @@ class PerceptionCircuit(nn.Module):
             layer = nn.ModuleList([LogicGate(device) for _ in range(num_gates[i])])
             self.layers.append(layer)
         
-        # Try to JIT compile for speed
-        try:
-            for i, layer in enumerate(self.layers):
-                for j, gate in enumerate(layer):
-                    self.layers[i][j] = torch.jit.script(gate)
-        except Exception as e:
-            print(f"Warning: Could not JIT compile gates: {e}")
+        # Remove problematic JIT compilation attempts
             
     def forward(self, neighborhood, hard=False):
         """
@@ -166,8 +160,9 @@ class PerceptionCircuit(nn.Module):
                 outputs.append(gate_output)
         
         # Final layer should have a single output per sample
-        # Average across channels for stability
-        return outputs[0].mean(dim=(1,2))
+        # Average across channels and return flattened output
+        # Must return a 2D tensor [batch, feature]
+        return outputs[0].mean(dim=(1,2)).unsqueeze(1)  # [batch, 1]
 
 
 class UpdateCircuit(nn.Module):
@@ -283,12 +278,6 @@ class DiffLogicCAImage(DifferentiableImage):
         # Initialize update circuit
         self.update_circuit = UpdateCircuit(perception_kernels, ca_channels, device)
         
-        # JIT compile the update circuit for speed
-        try:
-            self.update_circuit = torch.jit.script(self.update_circuit)
-        except Exception as e:
-            print(f"Warning: Could not JIT compile update circuit: {e}")
-        
         # Output processing: convert the first rgb_channels to actual RGB values
         self.output_axes = ('s', 'y', 'x')
         self.lr = 1e-3
@@ -336,9 +325,9 @@ class DiffLogicCAImage(DifferentiableImage):
         neighborhoods = neighborhoods.view(channels, 9, -1).permute(2, 0, 1)  # [H*W, C, 9]
         neighborhoods = neighborhoods.reshape(-1, channels, 3, 3)  # [batch, C, 3, 3]
         
-        # Batch process perception circuits
+        # Batch process perception circuits - each returns a batch x 1 tensor
         perception_outputs = torch.cat([
-            kernel(neighborhoods, hard).unsqueeze(1) 
+            kernel(neighborhoods, hard)  # This should now return [batch, 1] 
             for kernel in self.perception_kernels
         ], dim=1)  # [batch, num_kernels]
         
