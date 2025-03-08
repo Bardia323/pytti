@@ -275,7 +275,7 @@ class GNCAImage(DifferentiableImage):
         self.tensor.copy_(tensor[1:])
     
     def decode_tensor(self):
-        """Convert to RGB tensor in the expected format for CLIP"""
+        """Convert to RGB tensor (like PixelImage, but simplified)"""
         width, height = self.image_shape
         pallet = self.sort_pallet()
         
@@ -292,18 +292,14 @@ class GNCAImage(DifferentiableImage):
         colors_cont = pallet[value_floors] * (1 - value_fracs) + pallet[value_ceils] * value_fracs
         colors_cont = (colors_cont * pallet_weights).sum(dim=2)
         
-        # Resize to final dimensions if needed
-        if self.scale > 1:
-            colors_cont = F.interpolate(
-                colors_cont.permute(2, 0, 1).unsqueeze(0),
-                size=(height, width),
-                mode='nearest'
-            ).squeeze(0)
-        else:
-            colors_cont = colors_cont.permute(2, 0, 1)
+        # Resize to final dimensions
+        colors_cont = F.interpolate(
+            colors_cont.permute(2, 0, 1).unsqueeze(0),
+            size=(height, width),
+            mode='nearest'
+        ).squeeze(0)
         
-        # Ensure tensor is in the correct format (C,H,W) and properly clamped
-        return colors_cont.clamp(0, 1)
+        return colors_cont
     
     def encode_image(self, pil_image, smart_encode=True, device=DEVICE):
         """Encode from PIL image with palette (like PixelImage)"""
@@ -453,24 +449,6 @@ class GNCAImage(DifferentiableImage):
     @torch.no_grad()
     def render_pallet(self):
         """Render palette for visualization (like PixelImage)"""
-        pallet = self.sort_pallet()
-        width, height = self.n_pallets * 16, self.pallet_size * 32
-        array = (pallet.mul(255).clamp(0, 255).cpu().numpy().astype(np.uint8))
-        return Image.fromarray(array).resize((width, height), Image.NEAREST)
-    
-    @torch.no_grad()
-    def decode_image(self):
-        """Convert to PIL image for display"""
-        tensor = self.decode_tensor()
-        array = (tensor.permute(1, 2, 0).mul(255).clamp(0, 255).cpu().numpy().astype(np.uint8))
-        return Image.fromarray(array)
-        array = (tensor.permute(1, 2, 0).mul(255).clamp(0, 255).cpu().numpy().astype(np.uint8))
-        return Image.fromarray(array)
-    def decode_image(self):
-        """Convert to PIL image for display"""
-        tensor = self.decode_tensor()
-        array = (tensor.permute(1, 2, 0).mul(255).clamp(0, 255).cpu().numpy().astype(np.uint8))
-        return Image.fromarray(array)
         pallet = self.sort_pallet()
         width, height = self.n_pallets * 16, self.pallet_size * 32
         array = (pallet.mul(255).clamp(0, 255).cpu().numpy().astype(np.uint8))
