@@ -1,4 +1,4 @@
-from torch import optim, nn, randn_like, zeros_like, rand_like
+from torch import optim, nn, randn_like, zeros_like, rand_like, no_grad
 from pytti.Notebook import tqdm
 from pytti import *
 import pandas as pd
@@ -233,7 +233,7 @@ class SwarmImageGuide():
             z = self.image_rep.decode_training_tensor()
             
             # Compute the loss (fitness) without computing gradients
-            with torch.no_grad():
+            with no_grad():
                 # Similar to DirectImageGuide's train method but without gradient computation
                 if self.embedder is not None:
                     image_embeds, offsets, sizes = self.embedder(self.image_rep, input=z)
