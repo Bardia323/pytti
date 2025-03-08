@@ -14,8 +14,8 @@ class GNCAImage(RGBImage):
     """
     
     @vram_usage_mode('GNCA Image')
-    def __init__(self, width, height, scale=1, device=DEVICE):
-        # Just use RGBImage as the base
+    def __init__(self, width, height, scale=1, device=DEVICE, **kwargs):
+        # Just use RGBImage as the base - ignore extra params
         super().__init__(width, height, scale, device)
         
         # Add our own parameters
