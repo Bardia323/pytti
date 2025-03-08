@@ -352,27 +352,49 @@ class DiffLogicCAImage(DifferentiableImage):
         self.state[..., :self.rgb_channels] = rgb
     
     def step(self, hard=False):
-        """Do almost nothing - just add tiny noise for exploration"""
-        # This function now does almost nothing - just add minimal noise
-        # All real optimization happens in train()
+        """Swarm intelligence behavior - pixels influence each other but remain individually intelligent"""
+        height, width, channels = self.state.shape
+        
         with torch.no_grad():
-            # Just add tiny noise (0.5%) to allow some exploration
-            noise = (torch.rand_like(self.state) - 0.5) * 0.005
-            self.state.data = (self.state.data + noise).clamp(0, 1)
+            # Create padded version for neighbor processing
+            padded = F.pad(self.state.permute(2, 0, 1), [1, 1, 1, 1], mode='replicate')
+            
+            # Create a kernel that gives more weight to the central pixel
+            kernel = torch.ones(1, 1, 3, 3, device=self.device)
+            kernel[0, 0, 1, 1] = 4.0  # Center has 4x weight of neighbors
+            kernel = kernel / kernel.sum()
+            
+            new_state = torch.zeros_like(self.state)
+            
+            # Process each channel with neighbor influence
+            for c in range(channels):
+                channel = padded[c:c+1].unsqueeze(0)
+                # Get weighted average of neighborhood
+                neighbors = F.conv2d(channel, kernel, padding=0)[0, 0]
+                
+                # Current state has 70% weight, neighbors have 30% influence
+                # This creates swarm behavior without overwhelming the pixels
+                new_state[..., c] = self.state[..., c] * 0.7 + neighbors * 0.3
+            
+            # Add small amount of noise for exploration
+            noise = (torch.rand_like(self.state) - 0.5) * 0.01
+            noise_mask = torch.rand_like(self.state) < 0.05  # Only 5% of pixels get noise
+            new_state = torch.where(noise_mask, new_state + noise, new_state).clamp(0, 1)
+        
+        self.state = nn.Parameter(new_state)
     
     def run_ca(self, steps=None, hard=False):
         """
-        Run CLIP optimization for multiple steps.
-        CA behavior is completely removed - this just adds noise now.
+        Run CA for multiple steps with swarm intelligence behavior.
+        Pixels influence their neighbors while maintaining individuality.
         """
         if steps is None:
             steps = self.steps
         
-        for _ in range(steps):
-            # Just add minimal exploration noise
-            with torch.no_grad():
-                noise = (torch.rand_like(self.state) - 0.5) * 0.01
-                self.state.data = (self.state.data + noise).clamp(0, 1)
+        # Use torch.no_grad for efficiency when not training
+        with torch.no_grad():
+            for _ in range(steps):
+                self.step(hard=hard)
     
     @torch.no_grad()
     def update(self):
@@ -504,8 +526,8 @@ class DiffLogicCAImage(DifferentiableImage):
 
     def train(self, i, prompts, interp_prompts, loss_augs, interp_steps=0):
         """
-        Direct CLIP guidance for each pixel - AGGRESSIVE VERSION.
-        Each pixel directly minimizes CLIP loss with no CA behavior.
+        Balance between direct CLIP guidance and swarm intelligence.
+        Pixels minimize CLIP loss individually but also collaborate with neighbors.
         """
         # Get the current image tensor
         z = self.get_image_tensor()
@@ -534,36 +556,33 @@ class DiffLogicCAImage(DifferentiableImage):
         if i % 10 == 0:
             print(f"CLIP Loss at step {i}: {total_loss.item()}")
         
-        # Now use the loss to guide each pixel directly - this is the key part
+        # Now use the loss to guide the state evolution
         if total_loss > 0:
             # Calculate gradients
             total_loss.backward()
             
-            # Apply gradients directly with AGGRESSIVE learning rates
+            # Apply gradients with balance between individual and group behavior
             with torch.no_grad():
                 grad = self.state.grad
                 if grad is not None:
-                    # Fixed high learning rate - no decay
-                    base_lr = 0.2
+                    # Higher learning rate to ensure visible change
+                    base_lr = 0.1
                     
-                    # Apply changes directly proportional to gradient strength
-                    grad_strength = grad.abs()
+                    # Calculate average gradient strength to identify important areas
+                    mean_grad_strength = grad.abs().mean()
                     
-                    # Normalize gradient strength
-                    if grad_strength.max() > 0:
-                        # Print max gradient for debugging
-                        if i % 10 == 0:
-                            print(f"Max gradient: {grad_strength.max().item()}")
+                    # Apply changes to each pixel based on gradients
+                    for c in range(self.ca_channels):
+                        # RGB channels get stronger updates
+                        lr_multiplier = 1.0 if c < self.rgb_channels else 0.5
                         
-                        # Apply STRONG updates to RGB channels
-                        for c in range(min(3, self.rgb_channels)):
-                            # Direct application of scaled gradients
-                            self.state.data[..., c] -= grad[..., c] * base_lr
+                        # Apply gradient updates with attention to stronger gradients
+                        grad_strength = grad[..., c].abs()
+                        importance = torch.sigmoid((grad_strength - mean_grad_strength*0.5) * 5)  # Identify important areas
                         
-                        # Apply smaller updates to hidden channels if they exist
-                        if self.ca_channels > self.rgb_channels:
-                            for c in range(self.rgb_channels, self.ca_channels):
-                                self.state.data[..., c] -= grad[..., c] * base_lr * 0.5
+                        # Apply stronger updates to important areas, gentler to others
+                        pixel_updates = -grad[..., c] * base_lr * lr_multiplier * (1.0 + importance)
+                        self.state.data[..., c] += pixel_updates
                     
                     # Ensure values stay in proper range
                     self.state.data.clamp_(0, 1)
@@ -571,12 +590,8 @@ class DiffLogicCAImage(DifferentiableImage):
                     # Zero gradients for next step
                     self.state.grad.zero_()
         
-        # NO CA step - completely removed CA behavior
-        # Just add minimal noise for exploration
-        with torch.no_grad():
-            noise = (torch.rand_like(self.state) - 0.5) * 0.01
-            mask = torch.rand_like(self.state) < 0.1  # Only apply to 10% of pixels
-            self.state.data = torch.where(mask, self.state.data + noise, self.state.data).clamp(0, 1)
+        # Apply swarm behavior to allow pixels to communicate
+        self.step(hard=False)
         
         return losses
 
