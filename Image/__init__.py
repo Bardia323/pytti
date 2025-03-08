@@ -159,3 +159,4 @@ from pytti.Image.RGBImage import RGBImage
 from pytti.Image.VQGANImage import VQGANImage
 from pytti.Image.MultiResImage import MultiResImage
 from pytti.Image.LimitedPaletteMultiResImage import LimitedPaletteMultiResImage
+from pytti.Image.GNCAImage import GNCAImage
