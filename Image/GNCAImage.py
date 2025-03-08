@@ -3,6 +3,7 @@ from pytti.Image import DifferentiableImage
 from pytti.Image.RGBImage import RGBImage  # Import the known working version
 from pytti.LossAug import HSVLoss
 from pytti.ImageGuide import DirectImageGuide
+from pytti.Image.PixelImage import HdrLoss, PalletLoss
 import torch
 from torch import nn, optim
 from torch.nn import functional as F
