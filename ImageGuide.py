@@ -596,8 +596,6 @@ class EnhancedImageGuide(DirectImageGuide):
 
     def run_steps(self, n_steps, prompts, interp_prompts, loss_augs, stop=-math.inf, interp_steps=0, i_offset=0, skipped_steps=0):
         """Runs n_steps of optimization with progressive growing"""
-        self.image_rep.init_optimizer(self.optimizer)
-        
         pbar = tqdm(range(n_steps))
         best_iter = 0
         best_loss = float('inf')
