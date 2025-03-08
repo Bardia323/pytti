@@ -179,7 +179,7 @@ class EnhancedImageGuide(DirectImageGuide):
     """
     def __init__(self, image_rep, embedder, optimizer_name='adam', lr=None, adaptive_weights=False, 
                  weight_update_freq=10, weight_scale_factor=0.5, progressive_growing=False,
-                 start_resolution_scale=0.25, final_resolution_steps=1000, resolution_delay=0, **optimizer_params):
+                 start_resolution_scale=0.25, final_resolution_steps=15, resolution_delay=0, **optimizer_params):
         """
         image_rep: The image representation to optimize
         embedder: The embedder to use for image-text comparison
@@ -467,12 +467,8 @@ class EnhancedImageGuide(DirectImageGuide):
         # Calculate progress (0 to 1) for resolution scaling
         progress = min(1.0, (i - self.resolution_delay) / self.final_resolution_steps)
         
-        # Exponential growth curve (smoother initial growth, faster towards end)
-        # This creates a more natural progression than linear
-        growth_factor = progress ** 0.5
-        
-        # Calculate current scale
-        current_scale = self.start_resolution_scale + (1.0 - self.start_resolution_scale) * growth_factor
+        # Quick linear growth for very short runs
+        current_scale = self.start_resolution_scale + (1.0 - self.start_resolution_scale) * progress
         
         # Update resolution
         self._set_current_resolution(current_scale)
