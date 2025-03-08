@@ -7,97 +7,9 @@ from PIL import Image
 import numpy as np
 import torch
 
-class CAModel(nn.Module):
-    """PyTorch implementation of the Growing Neural Cellular Automata model"""
-    
-    def __init__(self, channel_n=16, fire_rate=0.5):
-        super().__init__()
-        self.channel_n = channel_n
-        self.fire_rate = fire_rate
-        
-        # Create the perception kernels manually
-        self.register_buffer('identity', torch.tensor([0, 1, 0, 1, 0, 1, 0, 1, 0], 
-                                                    dtype=torch.float32).reshape(1, 1, 3, 3))
-        self.register_buffer('dx', torch.tensor([1, 2, 1, 0, 0, 0, -1, -2, -1], 
-                                              dtype=torch.float32).reshape(1, 1, 3, 3) / 8.0)
-        self.register_buffer('dy', torch.tensor([1, 0, -1, 2, 0, -2, 1, 0, -1], 
-                                              dtype=torch.float32).reshape(1, 1, 3, 3) / 8.0)
-        
-        # Update network
-        self.dmodel = nn.Sequential(
-            nn.Conv2d(channel_n * 3, 128, 1),
-            nn.ReLU(),
-            nn.Conv2d(128, channel_n, 1, bias=False)
-        )
-        # Initialize last layer to zeros for stability
-        self.dmodel[-1].weight.data.zero_()
-    
-    def perceive(self, x, angle=0.0):
-        """Apply perception kernels to the input tensor"""
-        batch_size, c, h, w = x.shape
-        
-        # Simple method: process each channel separately
-        identity_out = []
-        dx_out = []
-        dy_out = []
-        
-        # Apply rotation if needed
-        if angle != 0.0:
-            c, s = torch.cos(torch.tensor(angle)), torch.sin(torch.tensor(angle))
-            dx_rotated = c * self.dx - s * self.dy
-            dy_rotated = s * self.dx + c * self.dy
-        else:
-            dx_rotated = self.dx
-            dy_rotated = self.dy
-
-        # Process each channel separately
-        for i in range(self.channel_n):
-            x_ch = x[:, i:i+1]  # Get one channel at a time
-            
-            # Apply the three kernels
-            identity_out.append(F.conv2d(x_ch, self.identity, padding=1))
-            dx_out.append(F.conv2d(x_ch, dx_rotated, padding=1))
-            dy_out.append(F.conv2d(x_ch, dy_rotated, padding=1))
-        
-        # Concatenate the results (batch, channel*perception, h, w)
-        identity_out = torch.cat(identity_out, dim=1)
-        dx_out = torch.cat(dx_out, dim=1)
-        dy_out = torch.cat(dy_out, dim=1)
-        
-        # Stack all perception outputs
-        return torch.cat([identity_out, dx_out, dy_out], dim=1)
-    
-    def get_living_mask(self, x):
-        """Determine which cells are alive based on alpha channel"""
-        alpha = x[:, 3:4, :, :]
-        return F.max_pool2d(alpha, 3, stride=1, padding=1) > 0.1
-    
-    def forward(self, x, fire_rate=None, angle=0.0, step_size=1.0):
-        """Run one step of the CA model"""
-        pre_life_mask = self.get_living_mask(x)
-        
-        # Perceive neighborhood
-        y = self.perceive(x, angle)
-        
-        # Compute update
-        dx = self.dmodel(y) * step_size
-        
-        # Apply stochastic update
-        if fire_rate is None:
-            fire_rate = self.fire_rate
-        update_mask = (torch.rand_like(x[:, :1]) <= fire_rate).float()
-        x = x + dx * update_mask
-        
-        # Apply life mask
-        post_life_mask = self.get_living_mask(x)
-        life_mask = pre_life_mask & post_life_mask
-        
-        return x * life_mask.float()
-
 class GNCAImage(DifferentiableImage):
     """
-    Differentiable image powered by Growing Neural Cellular Automata.
-    Provides the same interface as PixelImage for compatibility.
+    Simplified GNCA-based image for Pytti
     """
     
     @vram_usage_mode('Growing Neural CA Image')
@@ -106,83 +18,67 @@ class GNCAImage(DifferentiableImage):
         self.scale = scale
         self.channel_n = channel_n
         
-        # Create the CA model
-        self.ca_model = CAModel(channel_n=channel_n).to(device)
+        # Create simple RGB image tensor instead of complex CA
+        self.tensor = nn.Parameter(torch.zeros(3, height, width, device=device))
         
-        # CA state (RGBA + hidden channels)
-        self.state = nn.Parameter(torch.zeros(1, channel_n, height, width, device=device))
+        # Match PixelImage's tensor structure (value + channels)
+        self.value = nn.Parameter(torch.zeros(height, width, device=device))
         
-        # IMPORTANT: Match PixelImage output_axes exactly
-        self.output_axes = ('n', 's', 'y', 'x')  # Not 'c' but 's'!
+        # Keep PixelImage's exact output_axes
+        self.output_axes = ('n', 's', 'y', 'x')
         
-        # For targeting specific images
-        self.target_image = None
-        self.use_target = False
-        self.steps_per_update = 1
-        
-        # Set the seed (center pixel)
+        # Initialize with some visible content
         self.reset_state()
     
     def reset_state(self):
-        """Reset the CA state to a single seed in the center"""
+        """Initialize the image with a visible pattern"""
         with torch.no_grad():
-            self.state.zero_()
-            h, w = self.state.shape[2:]
-            cx, cy = w // 2, h // 2
-            seed_size = 3  # Larger seed for better visibility
-            x_start, x_end = max(0, cx-seed_size//2), min(w, cx+seed_size//2+1)
-            y_start, y_end = max(0, cy-seed_size//2), min(h, cy+seed_size//2+1)
+            self.tensor.zero_()
+            self.value.zero_()
+            h, w = self.tensor.shape[1:]
             
-            # Initialize RGB to white (visible seed)
-            self.state[0, :3, y_start:y_end, x_start:x_end] = 1.0
-            # Set alpha (life) to 1
-            self.state[0, 3:4, y_start:y_end, x_start:x_end] = 1.0
-            # Set some hidden state for growth potential
-            self.state[0, 4:, y_start:y_end, x_start:x_end] = 0.1
+            # Create a simple pattern - gradient background
+            y_coords = torch.linspace(0, 1, h).view(-1, 1).repeat(1, w)
+            x_coords = torch.linspace(0, 1, w).view(1, -1).repeat(h, 1)
+            
+            # Set RGB channels with different patterns
+            self.tensor[0] = y_coords  # Red
+            self.tensor[1] = x_coords  # Green
+            self.tensor[2] = (y_coords + x_coords) / 2  # Blue
+            
+            # Set value for compatibility
+            self.value.copy_(y_coords)
     
     def clone(self):
         """Create a clone of this image"""
         width, height = self.image_shape
         clone = GNCAImage(width, height, self.scale, self.channel_n)
         with torch.no_grad():
-            clone.state.copy_(self.state)
-            clone.ca_model.load_state_dict(self.ca_model.state_dict())
-            clone.steps_per_update = self.steps_per_update
-            clone.use_target = self.use_target
-            if self.target_image is not None:
-                clone.target_image = self.target_image.clone()
+            clone.tensor.copy_(self.tensor)
+            clone.value.copy_(self.value)
         return clone
     
     def get_image_tensor(self):
-        """Return the inner state tensor - required for transformations"""
-        # The shape must be exactly like what PixelImage returns
-        # PixelImage concatenates value and tensor in channel dimension
-        return self.state.squeeze(0)
+        """Return tensor in PixelImage format: [value, tensor]"""
+        return torch.cat([self.value.unsqueeze(0), self.tensor])
     
     def set_image_tensor(self, tensor):
-        """Set the inner state tensor - required for transformations"""
+        """Set tensor from PixelImage format: [value, tensor]"""
         with torch.no_grad():
-            self.state.copy_(tensor.unsqueeze(0))
+            self.value.copy_(tensor[0])
+            self.tensor.copy_(tensor[1:])
     
     def decode_tensor(self):
-        """Convert the CA state to an RGB image tensor"""
-        # Extract RGBA channels and convert to RGB
-        rgba = self.state[0, :4]
-        rgb = rgba[:3]
-        alpha = rgba[3:4]
-        
-        # Premultiply RGB by alpha for compositing
-        rgb_out = (1.0 - alpha) + rgb
-        
-        return rgb_out
+        """Convert to RGB tensor"""
+        return self.tensor
     
     def encode_image(self, pil_image, smart_encode=True, device=DEVICE):
-        """Set a target image for the CA to grow towards"""
+        """Set from target image"""
         # Convert PIL image to tensor
         img_tensor = TF.to_tensor(pil_image).to(device)
         
         # Resize to match our dimensions
-        h, w = self.state.shape[2:]
+        h, w = self.tensor.shape[1:]
         if img_tensor.shape[1] != h or img_tensor.shape[2] != w:
             img_tensor = F.interpolate(
                 img_tensor.unsqueeze(0),
@@ -191,76 +87,40 @@ class GNCAImage(DifferentiableImage):
                 align_corners=False
             ).squeeze(0)
         
-        # Store as target
-        self.target_image = img_tensor
-        self.use_target = True
-        
-        # Reset CA state to a seed
-        self.reset_state()
-        
-        # If smart_encode, pre-train the CA to approach the target
-        if smart_encode:
-            self.pretrain_ca(steps=100)
-    
-    def pretrain_ca(self, steps=100):
-        """Pre-train the CA to grow towards the target image"""
-        if not self.use_target or self.target_image is None:
-            return
-            
-        # Create optimizer for CA parameters
-        optimizer = optim.Adam(self.ca_model.parameters(), lr=2e-3)
-        
-        # Pre-training loop
-        for _ in range(steps):
-            # Run multiple CA steps
-            x = self.state.clone()
-            for _ in range(8):  # Run multiple steps for each optimization step
-                x = self.ca_model(x)
-            
-            # Calculate loss against target
-            rgb = x[0, :3]
-            target_rgb = self.target_image[:3]
-            loss = F.mse_loss(rgb, target_rgb)
-            
-            # Update parameters
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            
-            # Update state
-            with torch.no_grad():
-                self.state.copy_(x.detach())
+        # Set tensor directly
+        with torch.no_grad():
+            self.tensor.copy_(img_tensor)
+            # Also set value tensor to grayscale for compatibility
+            self.value.copy_((0.299 * img_tensor[0] + 0.587 * img_tensor[1] + 0.114 * img_tensor[2]))
     
     @torch.no_grad()
     def update(self):
-        """Run CA steps to update the state"""
-        for _ in range(self.steps_per_update):
-            self.state.copy_(self.ca_model(self.state))
+        """Minimal update for animation"""
+        # Apply a simple blur for some movement
+        kernel_size = 3
+        kernel = torch.ones(1, 1, kernel_size, kernel_size, device=self.tensor.device) / (kernel_size ** 2)
+        
+        # Apply blur separately to each channel
+        for i in range(3):
+            channel = self.tensor[i:i+1].unsqueeze(0)
+            blurred = F.conv2d(channel, kernel, padding=kernel_size//2)
+            self.tensor[i:i+1] = blurred.squeeze(0)
     
     @torch.no_grad()
     def decode_image(self):
         """Convert to PIL image for display"""
-        tensor = self.decode_tensor()
+        tensor = self.tensor
         array = (tensor.permute(1, 2, 0).mul(255).clamp(0, 255).cpu().numpy().astype(np.uint8))
         return Image.fromarray(array)
     
-    def set_steps_per_update(self, steps):
-        """Set how many CA steps to run per update"""
-        self.steps_per_update = steps
-    
-    # Additional methods to maintain compatibility with PixelImage
+    # PixelImage compatibility methods
     def image_loss(self):
-        """Return empty list for compatibility"""
         return []
     
     def set_pallet_target(self, pil_image):
-        """Compatibility method"""
         if pil_image is not None:
             self.encode_image(pil_image)
-        else:
-            self.use_target = False
     
     @torch.no_grad()
     def lock_pallet(self, lock=True):
-        """Compatibility method"""
         pass 
