@@ -183,9 +183,14 @@ class EnhancedImageGuide(DirectImageGuide):
     1. Multiple optimizer types (Adam, AdamW, RAdam, Lookahead)
     2. Adaptive loss weighting
     3. Gradient clipping to prevent exploding gradients
+    4. Loss plateau detection with automatic learning rate reduction
+    5. Auto-tuned weight scale factor for optimal balance adaptation
     """
     def __init__(self, image_rep, embedder, optimizer_name='adam', lr=None, adaptive_weights=False, 
-                 weight_update_freq=10, weight_scale_factor=0.5, grad_clip=1.0, **optimizer_params):
+                 weight_update_freq=10, weight_scale_factor=0.5, grad_clip=1.0,
+                 detect_plateaus=True, plateau_patience=50, plateau_factor=0.5, min_lr=1e-6,
+                 auto_tune_weights=False, min_scale_factor=0.1, max_scale_factor=0.9,
+                 **optimizer_params):
         """
         image_rep: The image representation to optimize
         embedder: The embedder to use for image-text comparison
@@ -195,6 +200,13 @@ class EnhancedImageGuide(DirectImageGuide):
         weight_update_freq: How often to update loss weights (in steps)
         weight_scale_factor: How strongly to adjust weights (0-1)
         grad_clip: Maximum norm for gradient clipping (None to disable)
+        detect_plateaus: Whether to enable plateau detection
+        plateau_patience: How many steps to wait before reducing LR
+        plateau_factor: Factor to multiply LR by when plateau detected
+        min_lr: Minimum learning rate
+        auto_tune_weights: Whether to automatically adjust weight_scale_factor
+        min_scale_factor: Minimum value for auto-tuned scale factor
+        max_scale_factor: Maximum value for auto-tuned scale factor
         """
         self.image_rep = image_rep
         self.embedder = embedder
@@ -210,6 +222,26 @@ class EnhancedImageGuide(DirectImageGuide):
         self.weight_update_freq = weight_update_freq
         self.weight_scale_factor = weight_scale_factor
         self.grad_clip = grad_clip
+        
+        # Setup plateau detection
+        self.detect_plateaus = detect_plateaus
+        self.plateau_patience = plateau_patience
+        self.plateau_factor = plateau_factor
+        self.min_lr = min_lr
+        self.best_loss = float('inf')
+        self.plateau_counter = 0
+        self.initial_lr = optimizer_params['lr']
+        
+        # Setup auto-tuned weight scale factor
+        self.auto_tune_weights = auto_tune_weights
+        self.min_scale_factor = min_scale_factor
+        self.max_scale_factor = max_scale_factor
+        self.base_scale_factor = weight_scale_factor
+        self.current_scale_factor = weight_scale_factor
+        self.loss_variance = 0
+        self.loss_window = []
+        self.max_loss_window = 10  # Track last 10 losses for variance calculation
+        
         self.loss_history = {}
         self.initial_weights = {}
         
@@ -412,6 +444,97 @@ class EnhancedImageGuide(DirectImageGuide):
         # Clear the list
         self.weights_to_update = []
     
+    def _check_plateau(self, current_loss):
+        """
+        Checks if training has plateaued and reduces learning rate if needed.
+        Returns True if learning rate was reduced.
+        """
+        if not self.detect_plateaus:
+            return False
+            
+        # If loss improved, reset counter and update best loss
+        if current_loss < self.best_loss:
+            self.best_loss = current_loss
+            self.plateau_counter = 0
+            return False
+            
+        # Increment counter if no improvement
+        self.plateau_counter += 1
+        
+        # Check if we've reached patience limit
+        if self.plateau_counter >= self.plateau_patience:
+            # Get current learning rate
+            current_lr = None
+            for param_group in self.optimizer.param_groups:
+                current_lr = param_group['lr']
+                break
+                
+            if current_lr is None:
+                return False
+                
+            # Calculate new learning rate
+            new_lr = max(current_lr * self.plateau_factor, self.min_lr)
+            
+            # If we've hit the minimum learning rate, no need to reduce further
+            if current_lr <= self.min_lr:
+                return False
+                
+            # Apply new learning rate
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = new_lr
+                
+            # Reset counter and print message
+            self.plateau_counter = 0
+            print(f"Plateau detected! Reducing learning rate from {current_lr:.6f} to {new_lr:.6f}")
+            
+            return True
+            
+        return False
+
+    def _update_scale_factor(self, current_loss):
+        """
+        Dynamically adjust weight_scale_factor based on loss stability.
+        More stable losses allow for more aggressive weight adjustments.
+        """
+        if not self.auto_tune_weights:
+            self.weight_scale_factor = self.base_scale_factor
+            return
+            
+        # Add current loss to window
+        self.loss_window.append(current_loss)
+        
+        # Keep window at max size
+        if len(self.loss_window) > self.max_loss_window:
+            self.loss_window.pop(0)
+            
+        # Need at least a few losses to calculate variance
+        if len(self.loss_window) < 3:
+            return
+            
+        # Calculate coefficient of variation (normalized measure of dispersion)
+        mean_loss = sum(self.loss_window) / len(self.loss_window)
+        if mean_loss <= 0:  # Avoid division by zero
+            return
+            
+        variance = sum((x - mean_loss) ** 2 for x in self.loss_window) / len(self.loss_window)
+        std_dev = variance ** 0.5
+        coef_var = std_dev / mean_loss if mean_loss > 0 else 0
+        
+        # Normalize to 0-1 range for reasonable coefficient of variation values
+        # Lower values mean more stable (less variance relative to mean)
+        stability = max(0, min(1, 1 - (coef_var * 5)))  # Scale and invert
+        
+        # Calculate new scale factor - higher stability allows higher scale factor
+        new_scale = self.min_scale_factor + stability * (self.max_scale_factor - self.min_scale_factor)
+        
+        # Update instance variables
+        self.current_scale_factor = new_scale
+        self.weight_scale_factor = new_scale
+        
+        # Log change if significant
+        if abs(new_scale - self.base_scale_factor) > 0.05:
+            print(f"Auto-tuning weight scale factor: {new_scale:.3f} (stability: {stability:.3f})")
+
     def train(self, i, prompts, interp_prompts, loss_augs, interp_steps=0, save_loss=True):
         """Performs a training step with adaptive weight adjustment."""
         self.optimizer.zero_grad()
@@ -475,6 +598,11 @@ class EnhancedImageGuide(DirectImageGuide):
         if self.adaptive_weights:
             self._store_initial_weights(prompt_losses, aug_losses, image_losses)
             
+        # Update scale factor before calculating weight updates
+        loss_value = float(total_loss)  # Calculate loss value here for reuse
+        if self.auto_tune_weights and self.adaptive_weights:
+            self._update_scale_factor(loss_value)
+            
         # Update weights adaptively if enabled - this now just calculates new weights
         # but doesn't apply them yet to avoid autograd errors
         self._update_loss_weights(i, prompt_losses, aug_losses, image_losses)
@@ -487,7 +615,7 @@ class EnhancedImageGuide(DirectImageGuide):
 
         # Prepare loss tracking
         if save_loss:
-            loss_dict = {'TOTAL': float(total_loss)}
+            loss_dict = {'TOTAL': loss_value}
             loss_dict.update({str(k): float(v[0]) for k, v in prompt_losses.items()})
             loss_dict.update({str(k): float(v[0]) for k, v in aug_losses.items()})
             loss_dict.update({str(k): float(v[0]) for k, v in image_losses.items()})
@@ -511,5 +639,8 @@ class EnhancedImageGuide(DirectImageGuide):
             self._apply_weight_updates()
             
         self.image_rep.update()
+        
+        # Check for plateaus and reduce learning rate if needed
+        self._check_plateau(loss_value)
 
-        return {'TOTAL': float(total_loss)}
+        return {'TOTAL': loss_value}
