@@ -1,96 +1,95 @@
 from pytti import *
 from pytti.Image import DifferentiableImage
+from pytti.Image.RGBImage import RGBImage  # Import the known working version
 import torch
-from torch import nn, optim
+from torch import nn
 from torch.nn import functional as F
 from torchvision.transforms import functional as TF
 from PIL import Image
 import numpy as np
 
-class GNCAImage(DifferentiableImage):
+class GNCAImage(RGBImage):
     """
-    Differentiable image format with GNCA-inspired animation.
+    GNCA image based on RGBImage
+    Uses simple blur-based animation as a placeholder for full CA
     """
+    
     @vram_usage_mode('GNCA Image')
-    def __init__(self, width, height, scale=1, channel_n=16, device=DEVICE):
-        super().__init__(width, height)
-        self.scale = scale
-        self.channel_n = channel_n
+    def __init__(self, width, height, scale=1, device=DEVICE, **kwargs):
+        # Call parent exactly as in RGBImage
+        super().__init__(width, height, scale, device)
         
-        # EXACTLY match PixelImage's structure
-        self.value = nn.Parameter(torch.zeros(height, width, dtype=torch.float32, device=device))
-        self.tensor = nn.Parameter(torch.zeros(channel_n, height, width, dtype=torch.float32, device=device))
+        # Animation speed parameter
+        self.steps_per_update = 1
         
-        # CRITICAL: This is the exact output_axes from PixelImage
-        self.output_axes = ('n', 's', 'y', 'x')
-        
-        # Animation parameters
-        self.steps_per_update = 3
-        
-        # Initialize with seed
-        self.reset_state()
+        # Create initial pattern
+        self.init_pattern()
+    
+    def init_pattern(self):
+        """Create initial pattern"""
+        with torch.no_grad():
+            # Get actual tensor dimensions (NCHW format)
+            _, _, h, w = self.tensor.shape
+            
+            # Create simple pattern
+            for i in range(w):
+                for j in range(h):
+                    x, y = i/w, j/h
+                    self.tensor[0, 0, j, i] = ((x + y)/2) % 1.0  # Red
+                    self.tensor[0, 1, j, i] = x % 1.0  # Green
+                    self.tensor[0, 2, j, i] = y % 1.0  # Blue
     
     def reset_state(self):
-        """Initialize state with patterns"""
-        with torch.no_grad():
-            h, w = self.value.shape
+        """Compatibility with initialization code"""
+        self.init_pattern()
+    
+    def set_steps_per_update(self, steps):
+        """Animation speed setting"""
+        self.steps_per_update = steps
+    
+    @torch.no_grad()
+    def update(self):
+        """Simple animation - blur and add noise"""
+        for _ in range(self.steps_per_update):
+            # Make a copy for the update
+            updated = self.tensor.clone()
             
-            # Initialize value
-            y = torch.linspace(0, 1, h).view(-1, 1).expand(-1, w)
-            x = torch.linspace(0, 1, w).view(1, -1).expand(h, -1)
-            self.value.copy_((x + y) / 2)
+            # Apply simple 3x3 blur
+            for c in range(3):  # For each RGB channel
+                for i in range(1, self.tensor.shape[3]-1):
+                    for j in range(1, self.tensor.shape[2]-1):
+                        # Simple 3x3 average
+                        neighbors_sum = 0
+                        for di in [-1, 0, 1]:
+                            for dj in [-1, 0, 1]:
+                                neighbors_sum += self.tensor[0, c, j+dj, i+di]
+                        
+                        # Update with blur + small random change
+                        updated[0, c, j, i] = (neighbors_sum / 9.0) + torch.rand(1).item() * 0.02 - 0.01
             
-            # Initialize "life" (higher values in center)
-            cx, cy = w // 2, h // 2
-            for i in range(4):  # First 4 channels as RGBA
-                radius = min(w, h) // 4
-                dist = ((torch.arange(h)[:, None] - cy) ** 2 + 
-                        (torch.arange(w)[None, :] - cx) ** 2)
-                mask = (dist < radius**2).float()
-                
-                if i < 3:  # RGB channels
-                    self.tensor[i].copy_(mask * (i+1)/3)
-                else:  # Alpha channel - life
-                    self.tensor[i].copy_(mask)
+            # Update tensor with clipping
+            self.tensor.copy_(updated.clamp(0, 1))
     
     def clone(self):
         """Create a clone of this image"""
-        clone = GNCAImage(
-            self.image_shape[0] // self.scale, 
-            self.image_shape[1] // self.scale, 
-            self.scale, 
-            self.channel_n
-        )
+        width, height = self.image_shape
+        clone = GNCAImage(width, height, self.scale)
         with torch.no_grad():
-            clone.value.copy_(self.value)
             clone.tensor.copy_(self.tensor)
             clone.steps_per_update = self.steps_per_update
         return clone
     
-    def get_image_tensor(self):
-        """CRITICAL: Exactly match PixelImage's return format"""
-        return torch.cat([self.value.unsqueeze(0), self.tensor])
-    
-    def set_image_tensor(self, tensor):
-        """CRITICAL: Exactly match PixelImage's parameter format"""
-        with torch.no_grad():
-            self.value.copy_(tensor[0])
-            self.tensor.copy_(tensor[1:])
-    
     def decode_tensor(self):
         """Convert to RGB tensor"""
-        # Extract RGBA from first 4 channels
-        rgb = self.tensor[:3]
-        alpha = self.tensor[3:4]
-        
-        # Combine for output (match PixelImage's logic)
-        return rgb * alpha + (1.0 - alpha)
+        return self.tensor[0]  # Return [C, H, W] format
     
     def encode_image(self, pil_image, smart_encode=True, device=DEVICE):
         """Set from target image"""
+        # Convert PIL image to tensor
         img_tensor = TF.to_tensor(pil_image).to(device)
-        h, w = self.tensor.shape[1:]
         
+        # Resize to match our dimensions
+        h, w = self.tensor.shape[2:]
         if img_tensor.shape[1] != h or img_tensor.shape[2] != w:
             img_tensor = F.interpolate(
                 img_tensor.unsqueeze(0),
@@ -99,57 +98,18 @@ class GNCAImage(DifferentiableImage):
                 align_corners=False
             ).squeeze(0)
         
+        # Set tensor directly - keeping the batch dimension
         with torch.no_grad():
-            # Set RGB channels
-            self.tensor[:3].copy_(img_tensor)
-            
-            # Create alpha mask based on brightness
-            brightness = 0.299 * img_tensor[0] + 0.587 * img_tensor[1] + 0.114 * img_tensor[2]
-            self.tensor[3:4].copy_((brightness > 0.2).float())
-            
-            # Set value
-            self.value.copy_(brightness)
-    
-    def set_steps_per_update(self, steps):
-        """Animation speed"""
-        self.steps_per_update = steps
-    
-    @torch.no_grad()
-    def update(self):
-        """Apply cellular automaton-inspired update"""
-        for _ in range(self.steps_per_update):
-            # Life mask based on alpha channel
-            life_mask = self.tensor[3:4] > 0.1
-            
-            # Apply diffusion to RGB and alpha
-            for i in range(4):
-                # Simple diffusion via blur
-                kernel_size = 3
-                kernel = torch.ones(1, 1, kernel_size, kernel_size, device=self.tensor.device) / (kernel_size ** 2)
-                channel = self.tensor[i:i+1].unsqueeze(0)
-                blurred = F.conv2d(channel, kernel, padding=kernel_size//2).squeeze(0)
-                
-                # Add small noise for variation
-                noise = torch.randn_like(blurred) * 0.01
-                
-                # Update with diffusion + noise
-                self.tensor[i:i+1] = (blurred + noise).clamp(0, 1)
-            
-            # Apply life mask - only keep effects where cells are alive
-            self.tensor[:3] *= life_mask
-            
-            # Update value parameter too
-            brightness = 0.299 * self.tensor[0] + 0.587 * self.tensor[1] + 0.114 * self.tensor[2]
-            self.value.copy_(brightness)
+            self.tensor[0].copy_(img_tensor)
     
     @torch.no_grad()
     def decode_image(self):
         """Convert to PIL image for display"""
-        tensor = self.decode_tensor()
+        tensor = self.tensor[0]  # Remove batch dimension
         array = (tensor.permute(1, 2, 0).mul(255).clamp(0, 255).cpu().numpy().astype(np.uint8))
         return Image.fromarray(array)
     
-    # Methods needed for compatibility with PixelImage
+    # Methods needed for compatibility
     def image_loss(self):
         return []
     
