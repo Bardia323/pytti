@@ -27,8 +27,21 @@ class GNCAImage(DifferentiableImage):
         # Keep PixelImage's exact output_axes
         self.output_axes = ('n', 's', 'y', 'x')
         
+        # Animation parameters
+        self.steps_per_update = 1
+        self.update_mode = 'blur'  # 'blur', 'noise', 'none'
+        
         # Initialize with some visible content
         self.reset_state()
+    
+    def set_steps_per_update(self, steps):
+        """Configure animation speed"""
+        self.steps_per_update = steps
+        
+    def set_update_mode(self, mode):
+        """Set animation style: 'blur', 'noise', or 'none'"""
+        if mode in ['blur', 'noise', 'none']:
+            self.update_mode = mode
     
     def reset_state(self):
         """Initialize the image with a visible pattern"""
@@ -56,6 +69,8 @@ class GNCAImage(DifferentiableImage):
         with torch.no_grad():
             clone.tensor.copy_(self.tensor)
             clone.value.copy_(self.value)
+            clone.steps_per_update = self.steps_per_update
+            clone.update_mode = self.update_mode
         return clone
     
     def get_image_tensor(self):
@@ -66,7 +81,7 @@ class GNCAImage(DifferentiableImage):
         """Set tensor from PixelImage format: [value, tensor]"""
         with torch.no_grad():
             self.value.copy_(tensor[0])
-            self.tensor.copy_(tensor[1:])
+            self.tensor.copy_(tensor[1:4])  # Only take RGB channels
     
     def decode_tensor(self):
         """Convert to RGB tensor"""
@@ -96,15 +111,22 @@ class GNCAImage(DifferentiableImage):
     @torch.no_grad()
     def update(self):
         """Minimal update for animation"""
-        # Apply a simple blur for some movement
-        kernel_size = 3
-        kernel = torch.ones(1, 1, kernel_size, kernel_size, device=self.tensor.device) / (kernel_size ** 2)
-        
-        # Apply blur separately to each channel
-        for i in range(3):
-            channel = self.tensor[i:i+1].unsqueeze(0)
-            blurred = F.conv2d(channel, kernel, padding=kernel_size//2)
-            self.tensor[i:i+1] = blurred.squeeze(0)
+        for _ in range(self.steps_per_update):
+            if self.update_mode == 'blur':
+                # Apply a simple blur for some movement
+                kernel_size = 3
+                kernel = torch.ones(1, 1, kernel_size, kernel_size, device=self.tensor.device) / (kernel_size ** 2)
+                
+                # Apply blur separately to each channel
+                for i in range(3):
+                    channel = self.tensor[i:i+1].unsqueeze(0)
+                    blurred = F.conv2d(channel, kernel, padding=kernel_size//2)
+                    self.tensor[i:i+1] = blurred.squeeze(0)
+            
+            elif self.update_mode == 'noise':
+                # Add subtle noise
+                noise = torch.randn_like(self.tensor) * 0.02
+                self.tensor.add_(noise).clamp_(0, 1)
     
     @torch.no_grad()
     def decode_image(self):
