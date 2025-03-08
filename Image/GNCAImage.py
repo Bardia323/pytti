@@ -158,11 +158,11 @@ class GNCAImage(DifferentiableImage):
                 
             elif self.update_mode == 'edge':
                 # Edge detection for sharp transitions
-                # Sobel filters for edge detection
-                sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], 
-                                       device=self.tensor.device).view(1, 1, 3, 3)
-                sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], 
-                                       device=self.tensor.device).view(1, 1, 3, 3)
+                # Sobel filters for edge detection - ensure proper type
+                sobel_x = torch.tensor([[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]], 
+                                      device=self.tensor.device).view(1, 1, 3, 3)
+                sobel_y = torch.tensor([[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]], 
+                                      device=self.tensor.device).view(1, 1, 3, 3)
                 
                 for i in range(3):
                     channel = self.tensor[i:i+1].unsqueeze(0)
