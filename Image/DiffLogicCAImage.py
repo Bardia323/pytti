@@ -87,82 +87,74 @@ class PerceptionCircuit(nn.Module):
         for i in range(1, len(num_gates)):
             layer = nn.ModuleList([LogicGate(device) for _ in range(num_gates[i])])
             self.layers.append(layer)
-        
-        # Remove problematic JIT compilation attempts
             
     def forward(self, neighborhood, hard=False):
         """
         Process a 3x3 neighborhood for each channel.
         neighborhood: tensor of shape (batch, channels, 3, 3)
-        Returns: tensor of shape (batch, 1)
+        Returns: tensor of shape (batch, 1) - ALWAYS 2D
         """
         batch_size = neighborhood.shape[0]
         center = neighborhood[:, :, 1, 1]  # Center cell values (batch, channels)
         
-        # Vectorized extraction of neighbors (without center)
-        # Create a mask to exclude the center
-        mask = torch.ones(3, 3, device=neighborhood.device)
-        mask[1, 1] = 0
+        # Extract neighbors
+        # Simpler approach: just get the 8 neighbors directly
+        n_tl = neighborhood[:, :, 0, 0]  # top-left
+        n_tm = neighborhood[:, :, 0, 1]  # top-middle
+        n_tr = neighborhood[:, :, 0, 2]  # top-right
+        n_ml = neighborhood[:, :, 1, 0]  # middle-left
+        n_mr = neighborhood[:, :, 1, 2]  # middle-right
+        n_bl = neighborhood[:, :, 2, 0]  # bottom-left
+        n_bm = neighborhood[:, :, 2, 1]  # bottom-middle
+        n_br = neighborhood[:, :, 2, 2]  # bottom-right
         
-        # Extract neighbors using mask
-        neighbors = neighborhood * mask.view(1, 1, 3, 3)
-        neighbors = neighbors.reshape(batch_size, self.channels, -1)
-        
-        # Reshape for efficiency: each neighborhood now has 8 neighbors (excluding center)
-        neighbors = torch.cat([
-            neighbors[:, :, :4], 
-            neighbors[:, :, 5:]
-        ], dim=2)  # (batch, channels, 8)
+        neighbors = [n_tl, n_tm, n_tr, n_ml, n_mr, n_bl, n_bm, n_br]
         
         # First layer: connect center with neighbors
-        outputs = []
-        
+        layer1_outputs = []
         for gate in self.layers[0]:
-            # Process all batch items at once for this gate
-            gate_results = []
+            gate_outputs = []
+            for n in neighbors:
+                # Apply gate between center and each neighbor
+                result = torch.zeros(batch_size, device=neighborhood.device)
+                for b in range(batch_size):
+                    # We'll average the result over all channels
+                    channel_results = []
+                    for c in range(self.channels):
+                        channel_results.append(gate(center[b, c], n[b, c], hard))
+                    result[b] = torch.stack(channel_results).mean()
+                gate_outputs.append(result)
+            # Combine results for this gate (average over neighbors)
+            gate_result = torch.stack(gate_outputs, dim=1).mean(dim=1)
+            layer1_outputs.append(gate_result)
             
-            # Apply gate between center and each neighbor across all batch items
-            for i in range(8):  # 8 neighbors
-                # Broadcast center against each neighbor position
-                center_expanded = center.unsqueeze(-1)  # (batch, channels, 1)
-                neighbor_i = neighbors[:, :, i].unsqueeze(-1)  # (batch, channels, 1)
-                
-                # Apply gate efficiently
-                results = torch.cat([
-                    gate(center_expanded[:, c], neighbor_i[:, c], hard).unsqueeze(1)
-                    for c in range(self.channels)
-                ], dim=1)
-                gate_results.append(results)
-            
-            # Stack results for this gate
-            gate_output = torch.stack(gate_results, dim=2)  # (batch, channels, 8)
-            outputs.append(gate_output)
-        
-        # Process through remaining layers using vectorized operations
+        # Process through remaining layers
+        prev_outputs = layer1_outputs
         for layer_idx in range(1, len(self.layers)):
             layer = self.layers[layer_idx]
-            prev_outputs = outputs
-            outputs = []
+            next_outputs = []
             
             for gate_idx, gate in enumerate(layer):
-                input1_idx = gate_idx * 2
-                input2_idx = gate_idx * 2 + 1
+                # Get inputs from previous layer
+                idx1 = min(gate_idx * 2, len(prev_outputs) - 1)
+                idx2 = min(gate_idx * 2 + 1, len(prev_outputs) - 1)
                 
-                input1 = prev_outputs[min(input1_idx, len(prev_outputs)-1)]
-                input2 = prev_outputs[min(input2_idx, len(prev_outputs)-1)]
+                input1 = prev_outputs[idx1]
+                input2 = prev_outputs[idx2]
                 
-                # Apply gate to paired inputs from previous layer
-                gate_output = torch.cat([
-                    gate(input1[:, c], input2[:, c], hard).unsqueeze(1)
-                    for c in range(self.channels)
-                ], dim=1)
+                # Apply gate
+                result = torch.zeros(batch_size, device=neighborhood.device)
+                for b in range(batch_size):
+                    result[b] = gate(input1[b], input2[b], hard)
                 
-                outputs.append(gate_output)
-        
+                next_outputs.append(result)
+                
+            prev_outputs = next_outputs
+            
         # Final layer should have a single output per sample
-        # Average across channels and return flattened output
-        # Must return a 2D tensor [batch, feature]
-        return outputs[0].mean(dim=(1,2)).unsqueeze(1)  # [batch, 1]
+        # Guaranteed to be 2D tensor [batch, 1]
+        final_output = prev_outputs[0].view(batch_size, 1)
+        return final_output
 
 
 class UpdateCircuit(nn.Module):
@@ -325,11 +317,14 @@ class DiffLogicCAImage(DifferentiableImage):
         neighborhoods = neighborhoods.view(channels, 9, -1).permute(2, 0, 1)  # [H*W, C, 9]
         neighborhoods = neighborhoods.reshape(-1, channels, 3, 3)  # [batch, C, 3, 3]
         
-        # Batch process perception circuits - each returns a batch x 1 tensor
-        perception_outputs = torch.cat([
-            kernel(neighborhoods, hard)  # This should now return [batch, 1] 
-            for kernel in self.perception_kernels
-        ], dim=1)  # [batch, num_kernels]
+        # Collect perception outputs - each kernel now guarantees a (batch, 1) output
+        perception_outputs_list = []
+        for kernel in self.perception_kernels:
+            out = kernel(neighborhoods, hard)  # This will be (batch, 1)
+            perception_outputs_list.append(out)
+        
+        # Concatenate along feature dimension
+        perception_outputs = torch.cat(perception_outputs_list, dim=1)  # (batch, num_kernels)
         
         # Current cell states
         current_states = self.state.reshape(batch_size, channels)
