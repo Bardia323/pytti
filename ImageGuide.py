@@ -153,9 +153,12 @@ class DirectImageGuide():
                      sum(loss[0] for loss in image_losses.values()) + \
                      sum(interp_losses)
 
+        # Calculate loss value here for reuse
+        loss_value = float(total_loss)
+        
         # Prepare loss tracking
         if save_loss:
-            loss_dict = {'TOTAL': float(total_loss)}
+            loss_dict = {'TOTAL': loss_value}
             loss_dict.update({str(k): float(v[0]) for k, v in prompt_losses.items()})
             loss_dict.update({str(k): float(v[0]) for k, v in aug_losses.items()})
             loss_dict.update({str(k): float(v[0]) for k, v in image_losses.items()})
@@ -175,7 +178,7 @@ class DirectImageGuide():
         self.optimizer.step()
         self.image_rep.update()
 
-        return {'TOTAL': float(total_loss)}
+        return {'TOTAL': loss_value}
 
 class EnhancedImageGuide(DirectImageGuide):
     """
@@ -598,20 +601,22 @@ class EnhancedImageGuide(DirectImageGuide):
         if self.adaptive_weights:
             self._store_initial_weights(prompt_losses, aug_losses, image_losses)
             
+        # Aggregate losses
+        total_loss = sum(loss[0] for loss in prompt_losses.values()) + \
+                     sum(loss[0] for loss in aug_losses.values()) + \
+                     sum(loss[0] for loss in image_losses.values()) + \
+                     sum(interp_losses)
+                     
+        # Calculate loss value here for reuse
+        loss_value = float(total_loss)
+        
         # Update scale factor before calculating weight updates
-        loss_value = float(total_loss)  # Calculate loss value here for reuse
         if self.auto_tune_weights and self.adaptive_weights:
             self._update_scale_factor(loss_value)
             
         # Update weights adaptively if enabled - this now just calculates new weights
         # but doesn't apply them yet to avoid autograd errors
         self._update_loss_weights(i, prompt_losses, aug_losses, image_losses)
-
-        # Aggregate losses
-        total_loss = sum(loss[0] for loss in prompt_losses.values()) + \
-                     sum(loss[0] for loss in aug_losses.values()) + \
-                     sum(loss[0] for loss in image_losses.values()) + \
-                     sum(interp_losses)
 
         # Prepare loss tracking
         if save_loss:
