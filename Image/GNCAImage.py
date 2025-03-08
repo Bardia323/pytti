@@ -24,6 +24,10 @@ class GNCAImage(RGBImage):
         # Initialize with a pattern
         self.init_pattern()
     
+    def reset_state(self):
+        """Reset the image state to initial pattern"""
+        self.init_pattern()
+    
     def init_pattern(self):
         """Initialize with a pretty pattern"""
         with torch.no_grad():
@@ -31,18 +35,13 @@ class GNCAImage(RGBImage):
             _, _, h, w = self.tensor.shape
             
             # Create coordinate grids with correct dimensions
-            y = torch.linspace(0, 1, h).view(-1, 1).repeat(1, w).to(self.tensor.device)
-            x = torch.linspace(0, 1, w).view(1, -1).repeat(h, 1).to(self.tensor.device)
+            y = torch.linspace(0, 1, h).view(-1, 1).expand(-1, w).to(self.tensor.device)
+            x = torch.linspace(0, 1, w).view(1, -1).expand(h, -1).to(self.tensor.device)
             
             # Create interesting patterns
             r = torch.sin(x * 6.28) * 0.5 + 0.5  # Red channel
             g = torch.sin(y * 6.28) * 0.5 + 0.5  # Green channel
             b = torch.sin((x + y) * 4.28) * 0.5 + 0.5  # Blue channel
-            
-            # Verify shapes are correct
-            assert r.shape == (h, w)
-            assert g.shape == (h, w)
-            assert b.shape == (h, w)
             
             # Assign to tensor (keeping NCHW format)
             self.tensor[0, 0] = r
