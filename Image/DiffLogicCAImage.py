@@ -278,6 +278,37 @@ class DiffLogicCAImage(DifferentiableImage):
         # Output processing: convert the first rgb_channels to actual RGB values
         self.output_axes = ('s', 'y', 'x')
         self.lr = 1e-3
+        
+        # Special flag to disable 3D mode if needed
+        self.disable_3d = False
+        
+        # Pre-compute a depth map for 3D mode
+        self._depth_map = None
+        self._prepare_depth_map()
+    
+    def _prepare_depth_map(self):
+        """Generate a simple depth map for 3D animation"""
+        # Create a gradient from top to bottom that works well for depth models
+        depth = np.ones((self.height, self.width), dtype=np.float32) * 0.5
+        # Add vertical gradient (closer to top = further away)
+        for y in range(self.height):
+            depth[y, :] = 0.3 + 0.4 * (y / self.height)
+        self._depth_map = depth
+    
+    # This is a special method used by the 3D system to get depth information
+    def get_depth(self):
+        """Return our pre-computed depth map"""
+        if self._depth_map is None:
+            self._prepare_depth_map()
+        return self._depth_map, False
+    
+    # This is called by DepthLoss to get depth information
+    def get_depth_tensor(self):
+        """Return depth tensor for DepthLoss"""
+        if self._depth_map is None:
+            self._prepare_depth_map()
+        depth_tensor = torch.from_numpy(self._depth_map).to(self.device).float()
+        return depth_tensor.unsqueeze(0)  # Add batch dimension
     
     def clone(self):
         clone = DiffLogicCAImage(self.width, self.height, self.ca_channels, 
@@ -464,18 +495,22 @@ class DiffLogicCAImage(DifferentiableImage):
         # The depth model expects a standard RGB image
         return rgb_tensor
 
-    # Add this method for 3D compatibility
-    def get_latent_for_depth(self):
+    # When the 3D system asks for the latent, give it something simple
+    def get_latent_tensor(self, detach=False):
         """
-        Special method to provide compatible input for depth model.
-        This bypasses the normal image processing for the depth model.
+        Special handling for 3D mode - return a simplified representation
         """
-        # Convert our RGB image to the format expected by the depth model
-        rgb_tensor = self.decode_tensor()
+        # If we're in 3D mode and want to disable it
+        if self.disable_3d:
+            # Return zeros - this will effectively skip 3D processing
+            return torch.zeros(1, 3, self.height, self.width, device=self.device)
         
-        # The depth model gets confused by our format, so return a simpler
-        # format that it can handle - just a standard RGB image
-        return rgb_tensor
+        # Otherwise, return our standard tensor format but with NCHW format
+        # (batch, channels, height, width)
+        tensor = self.decode_tensor().unsqueeze(0)
+        if detach:
+            return tensor.detach()
+        return tensor
 
     def train(self, i, prompts, interp_prompts, loss_augs, interp_steps=0):
         """
@@ -533,52 +568,31 @@ class DiffLogicCAImage(DifferentiableImage):
         
         return losses
 
-# Add monkeypatch to make 3D mode work with our model
-# This overrides the get_depth method only for our images
-try:
-    from pytti.LossAug.DepthLoss import get_depth as original_get_depth
-
-    # Store the original method so we can still call it
-    original_get_depth_for_pil = original_get_depth
-
-    # Define a new method to handle DiffLogicCA images specially
-    def patched_get_depth(pil_image):
+    def encode_from_tensor(self, tensor, add_noise=False):
         """
-        Patched version of get_depth that handles our DiffLogicCA images specially
+        Special method to handle encoding from tensors in 3D mode.
+        This is used by the zoom_3d function in Transforms.py.
+        
+        Args:
+            tensor: Input tensor to encode (formats vary)
+            add_noise: Whether to add noise to the encoding
         """
-        # Create a simpler image for depth estimation - a blank image with a gradient
-        # This avoids errors with the depth model
-        width, height = pil_image.size
+        # Check tensor dimensions and format
+        if tensor.dim() == 4:  # NCHW format
+            tensor = tensor[0]  # Remove batch dimension
         
-        # Create a gradient image that depth models handle well
-        gradient = np.ones((height, width), dtype=np.float32) * 0.5
-        # Add a simple gradient from top to bottom
-        for y in range(height):
-            gradient[y, :] = 0.3 + 0.4 * (y / height)
+        if tensor.shape[0] == 3:  # CHW format
+            # Convert to our expected shape
+            rgb = tensor.permute(1, 2, 0)  # CHW -> HWC
+        else:
+            # Unknown format, use as is
+            rgb = tensor
         
-        # Return the simplified depth map
-        return gradient, False
-
-    # Only apply the patch if zoom_3d is being used with our model
-    def patch_depth_for_difflogic():
-        """Apply the patch to DepthLoss.get_depth"""
-        from pytti.LossAug import DepthLoss
-        DepthLoss.get_depth = patched_get_depth
-        print("Patched depth estimation for DiffLogicCA")
-
-    def restore_depth_original():
-        """Restore the original get_depth method"""
-        from pytti.LossAug import DepthLoss
-        DepthLoss.get_depth = original_get_depth_for_pil
-        print("Restored original depth estimation")
+        # Update our RGB channels
+        with torch.no_grad():
+            self.state.data[..., :self.rgb_channels] = rgb.clamp(0, 1)
         
-except ImportError:
-    # Handle case where the depth module isn't available
-    def patch_depth_for_difflogic():
-        print("Depth module not available, skipping patch")
-        
-    def restore_depth_original():
-        print("Depth module not available, nothing to restore")
+        return self
 
 def init_difflogic_ca(animation_mode="None"):
     """
@@ -590,13 +604,7 @@ def init_difflogic_ca(animation_mode="None"):
     """
     print(f"DiffLogicCA system initialized with animation mode: {animation_mode}")
     
-    # Apply different optimizations based on animation mode
-    if animation_mode == "3D":
-        # Apply our depth estimation patch to make 3D mode work
-        print("Applying 3D mode compatibility patch")
-        patch_depth_for_difflogic()
-    else:
-        # For other modes, use default handling
-        print("Using standard mode")
+    # No need for special patching anymore - we handle it in the class
+    print(f"Using DiffLogicCA with {animation_mode} mode")
     
     return True 
