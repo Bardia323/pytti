@@ -352,17 +352,18 @@ class DiffLogicCAImage(DifferentiableImage):
         self.state[..., :self.rgb_channels] = rgb
     
     def step(self, hard=False):
-        """Simplified step method with better balance between CA rules and CLIP guidance"""
+        """Balanced step method that prevents excessive brightness and maintains image structure"""
         height, width, channels = self.state.shape
         
-        # Use a simplified CA rule that preserves more of the image structure
+        # Use a balanced CA rule that prevents excessive brightness
         with torch.no_grad():
             # Create a padded version of the state
             padded = F.pad(self.state.permute(2, 0, 1), [1, 1, 1, 1], mode='replicate')
             
-            # Simple convolution to process neighborhoods
+            # Process neighborhoods with balance between center and neighbors
             kernel = torch.ones(1, 1, 3, 3, device=self.device)
-            kernel[0, 0, 1, 1] = 0.5  # Give more weight to the center cell
+            kernel[0, 0, 1, 1] = 1.0  # Equal weight to center as all neighbors combined
+            kernel = kernel / kernel.sum()  # Normalize to maintain overall brightness
             
             new_state = torch.zeros_like(self.state)
             
@@ -371,24 +372,54 @@ class DiffLogicCAImage(DifferentiableImage):
                 # Get this channel
                 channel = padded[c:c+1].unsqueeze(0)
                 
-                # Apply gentle neighborhood influence
+                # Apply balanced neighborhood processing
                 neighbors = F.conv2d(channel, kernel, padding=0)[0, 0]
                 
                 # Current state
                 current = self.state[..., c]
                 
-                # Apply modified rule that preserves more of the current state
+                # Global channel statistics for balancing
+                mean_val = current.mean()
+                
                 if hard:
-                    # For hard updates, use a more stable rule
-                    # Keep center cell with 70% probability, neighbors with 30%
-                    mask = torch.rand_like(current) > 0.3
-                    influence = neighbors * 0.3  # 30% influence from neighbors
-                    new_state[..., c] = torch.where(mask, current, (current * 0.7 + influence))
+                    # For hard updates, use a rule that maintains balance
+                    # Slight diffusion with brightness correction
+                    new_val = current * 0.6 + neighbors * 0.4
+                    
+                    # Apply contrast enhancement to prevent flat images
+                    # Move values away from the mean to maintain contrast
+                    enhance_contrast = (new_val - mean_val) * 0.2 + new_val
+                    
+                    # Clamp to valid range and apply some randomness
+                    rand_mask = torch.rand_like(current) > 0.9  # 10% random variation
+                    rand_vals = torch.rand_like(current) * 0.1
+                    
+                    new_state[..., c] = torch.where(
+                        rand_mask,
+                        enhance_contrast * 0.9 + rand_vals,
+                        enhance_contrast
+                    ).clamp(0, 1)
                 else:
-                    # For soft updates, blend current state with neighborhood
-                    # This preserves more of the current state (70%) while taking
-                    # some influence from neighbors (30%)
-                    new_state[..., c] = current * 0.7 + neighbors * 0.3
+                    # For soft updates, use a more gradual approach
+                    # Blend current with neighbors while maintaining contrast
+                    blend = current * 0.65 + neighbors * 0.35
+                    
+                    # Balance brightness - pull toward middle to prevent all-white/all-black
+                    brightness_correction = 0.5 + (blend - mean_val) * 0.8
+                    
+                    # Maintain some randomness for exploration
+                    noise = (torch.rand_like(current) - 0.5) * 0.05
+                    
+                    new_state[..., c] = (brightness_correction + noise).clamp(0, 1)
+        
+        # Apply a final global correction to prevent drift toward white or black
+        global_mean = new_state.mean()
+        if global_mean > 0.6:  # Too bright overall
+            correction = 1.0 - (global_mean - 0.5) * 2  # Scale down brightness
+            new_state = new_state * correction
+        elif global_mean < 0.4:  # Too dark overall
+            correction = 1.0 + (0.5 - global_mean) * 2  # Scale up brightness
+            new_state = torch.min(new_state * correction, torch.ones_like(new_state))
         
         self.state = nn.Parameter(new_state)
     
@@ -414,53 +445,58 @@ class DiffLogicCAImage(DifferentiableImage):
         self.step(hard=True)
     
     def encode_image(self, pil_image, smart_encode=True, device=DEVICE):
-        """Enhanced encode_image with better preservation of input image"""
+        """Enhanced encode_image with balanced brightness for better stability"""
         # Resize the image
         pil_image = pil_image.resize((self.width, self.height), Image.LANCZOS)
         
         # Convert to tensor and normalize to [0,1]
         img_tensor = TF.to_tensor(pil_image).to(device)
         
+        # Calculate initial statistics
+        img_mean = img_tensor.mean()
+        
         if smart_encode:
-            # Use a more flexible encoding that preserves more image detail
-            # Instead of just binary thresholding, use multiple levels
-            # Create levels for better detail preservation
-            levels = 5
-            rgb = torch.zeros_like(img_tensor)
+            # Use a more balanced encoding that preserves detail without brightening
+            # Balance brightness around 0.5
+            brightness_factor = 0.5 / max(img_mean, 0.1)  # Avoid division by zero
+            balanced_tensor = torch.clamp(img_tensor * brightness_factor, 0, 1)
             
-            # Create multi-level quantization
-            for level in range(levels):
-                threshold = level / (levels - 1)
-                rgb += (img_tensor > threshold).float() / levels
+            # Enhanced contrast for better features
+            mean_val = balanced_tensor.mean()
+            rgb = mean_val + (balanced_tensor - mean_val) * 1.2
+            rgb = rgb.clamp(0, 1)
         else:
-            # Simple binary encoding
-            rgb = (img_tensor > 0.5).float()
+            # Simple binary encoding with threshold at mean value
+            # This ensures 50% white, 50% black regardless of input
+            threshold = img_mean
+            rgb = (img_tensor > threshold).float()
         
         # Initialize state
         state = torch.zeros(self.height, self.width, self.ca_channels, device=device)
         state[..., :self.rgb_channels] = rgb.permute(1, 2, 0)
         
-        # Initialize hidden channels with some random noise for variety
+        # Initialize hidden channels with balanced random noise
         if self.ca_channels > self.rgb_channels:
-            # Small amount of noise in hidden channels
-            noise = torch.rand(self.height, self.width, self.ca_channels - self.rgb_channels, device=device) * 0.1
+            # Small amount of balanced noise in hidden channels
+            noise = torch.rand(self.height, self.width, self.ca_channels - self.rgb_channels, device=device) * 0.2 + 0.4
             state[..., self.rgb_channels:] = noise
         
-        # Create gradient in center for better pattern formation
+        # Add subtle gradient from center for better pattern formation
         center_h, center_w = self.height // 2, self.width // 2
         radius = min(self.height, self.width) // 4
         
-        # Add radial gradient from center
+        # Add subtle radial gradient influence
         y_coords = torch.arange(self.height, device=device).view(-1, 1).repeat(1, self.width)
         x_coords = torch.arange(self.width, device=device).view(1, -1).repeat(self.height, 1)
         dist = torch.sqrt((y_coords - center_h)**2 + (x_coords - center_w)**2)
         
-        # Create radial gradient mask
-        mask = torch.exp(-(dist**2) / (2 * radius**2))
+        # Create subtle radial gradient mask (only 10% influence)
+        mask = torch.exp(-(dist**2) / (2 * radius**2)) * 0.1
         
-        # Apply mask to all channels to create a central focus
-        for c in range(self.ca_channels):
-            state[..., c] = state[..., c] * (1.0 - mask * 0.3)
+        # Apply subtle mask to RGB channels only
+        for c in range(min(3, self.rgb_channels)):
+            # Pull slightly toward center value 0.5
+            state[..., c] = state[..., c] * (1.0 - mask) + 0.5 * mask
         
         self.state = nn.Parameter(state)
     
@@ -594,7 +630,7 @@ class DiffLogicCAImage(DifferentiableImage):
 
     def train(self, i, prompts, interp_prompts, loss_augs, interp_steps=0):
         """
-        Integration with Pytti's training loop with improved CLIP guidance.
+        Integration with Pytti's training loop with balanced CLIP guidance.
         This method is called by the DirectImageGuide to update the image based on prompts.
         """
         # Get the current image tensor
@@ -627,24 +663,43 @@ class DiffLogicCAImage(DifferentiableImage):
             total_loss.backward()
             
             # Use gradients to influence the CA state
-            # This is the key part - we're using the CLIP loss to guide the CA
             with torch.no_grad():
-                # Get gradients for the RGB channels
+                # Get gradients
                 grad = self.state.grad
                 if grad is not None:
-                    # Scale gradients to influence CA state
-                    # Focus on RGB channels (first 3)
+                    # Calculate gradient statistics for scaling
                     rgb_grad = grad[..., :self.rgb_channels]
+                    grad_abs_mean = rgb_grad.abs().mean()
                     
-                    # Apply stronger gradient influence
-                    influence = 0.1  # Increased from 0.01 to 0.1
-                    self.state.data[..., :self.rgb_channels] -= influence * rgb_grad
+                    # Scale factor to prevent huge gradient steps
+                    if grad_abs_mean > 0:
+                        scale_factor = min(0.05 / grad_abs_mean, 1.0)
+                    else:
+                        scale_factor = 0.05
                     
-                    # Also propagate some influence to other channels
+                    # Apply moderate influence to RGB channels
+                    influence = 0.05 * scale_factor
+                    
+                    # Only apply significant changes to areas that need it
+                    # Threshold to avoid subtle noise changes
+                    significant_changes = (rgb_grad.abs() > grad_abs_mean * 0.5)
+                    masked_grad = torch.where(
+                        significant_changes,
+                        rgb_grad,
+                        rgb_grad * 0.1  # Reduce influence in low-gradient areas
+                    )
+                    
+                    # Apply changes to RGB channels
+                    self.state.data[..., :self.rgb_channels] -= influence * masked_grad
+                    
+                    # Apply smaller changes to hidden channels
                     if self.ca_channels > self.rgb_channels:
-                        # Apply smaller influence to non-RGB channels
                         hidden_grad = grad[..., self.rgb_channels:]
-                        self.state.data[..., self.rgb_channels:] -= influence * 0.3 * hidden_grad
+                        # Less influence on hidden channels
+                        self.state.data[..., self.rgb_channels:] -= influence * 0.2 * hidden_grad
+                    
+                    # Ensure values stay in proper range
+                    self.state.data.clamp_(0, 1)
                     
                     # Zero gradients for next step
                     self.state.grad.zero_()
