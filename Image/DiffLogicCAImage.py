@@ -252,6 +252,9 @@ class DiffLogicCAImage(DifferentiableImage):
     """
     def __init__(self, width, height, ca_channels=8, rgb_channels=3, perception_kernels=16, steps=20, device=DEVICE):
         super().__init__(width, height)
+        # Ensure rgb_channels is at least 3
+        rgb_channels = max(3, rgb_channels)
+        
         self.width = width
         self.height = height
         self.ca_channels = ca_channels
@@ -305,59 +308,44 @@ class DiffLogicCAImage(DifferentiableImage):
         self.state[..., :self.rgb_channels] = rgb
     
     def step(self, hard=False):
-        """Run one CA update step (highly optimized)"""
+        """Simplified step method for better performance"""
         height, width, channels = self.state.shape
         
-        # Create padded tensor - channels first for efficient operations
-        state_channels_first = self.state.permute(2, 0, 1)
-        padded = F.pad(state_channels_first, [1, 1, 1, 1], mode='replicate')
-        
-        # Use efficient convolution operations instead of explicit neighborhoods
-        # This is MUCH faster than creating individual neighborhoods
-        batch_size = height * width
-        
-        # Apply perception kernels using convolution
-        perception_outputs = []
-        for kernel_idx, kernel in enumerate(self.perception_kernels):
-            # For each kernel, we'll use a simplified approach
-            # Instead of explicit neighborhoods, use convolution
-            kernel_outputs = []
+        # Use a simple cellular automaton rule for testing
+        # This is much faster than the full perception/update circuit
+        with torch.no_grad():
+            # Create a padded version of the state
+            padded = F.pad(self.state.permute(2, 0, 1), [1, 1, 1, 1], mode='replicate')
             
-            # Process each channel with a simple convolution
-            for ch in range(channels):
-                # Extract this channel
-                channel_data = padded[ch:ch+1]  # Keep dim for conv2d
+            # Simple convolution to count neighbors (for Game of Life-like rules)
+            kernel = torch.ones(1, 1, 3, 3, device=self.device)
+            kernel[0, 0, 1, 1] = 0  # Don't count the center cell
+            
+            new_state = torch.zeros_like(self.state)
+            
+            # Process each channel
+            for c in range(channels):
+                # Get this channel
+                channel = padded[c:c+1].unsqueeze(0)
                 
-                # Apply 3x3 convolution (simulates neighborhood processing)
-                # Create a simple weight that just sums the neighborhood
-                weight = torch.ones(1, 1, 3, 3, device=self.device) / 9.0
+                # Count neighbors
+                neighbors = F.conv2d(channel, kernel, padding=0)[0, 0]
                 
-                # Apply convolution
-                conv_result = F.conv2d(channel_data, weight, padding=0)
-                kernel_outputs.append(conv_result.squeeze(0))
-            
-            # Combine channel results
-            combined = torch.stack(kernel_outputs).mean(0)
-            perception_outputs.append(combined.reshape(-1))
+                # Current state
+                current = self.state[..., c]
+                
+                # Apply Game of Life-like rules
+                # Live cells with 2-3 neighbors survive
+                # Dead cells with 3 neighbors become alive
+                if hard:
+                    new_state[..., c] = ((current > 0.5) & ((neighbors >= 2) & (neighbors <= 3))) | ((current <= 0.5) & (neighbors == 3))
+                else:
+                    # Continuous version
+                    survive = (current > 0.5) * ((neighbors >= 2) & (neighbors <= 3)).float()
+                    born = (current <= 0.5) * (neighbors == 3).float()
+                    new_state[..., c] = survive + born
         
-        perception_outputs = torch.stack(perception_outputs, dim=1)
-        
-        # Current cell states
-        current_states = self.state.reshape(batch_size, channels)
-        
-        # Update states using a simplified update rule
-        # This avoids the complex circuit for now to test performance
-        with torch.no_grad():  # Use no_grad for testing
-            # Simple update rule: mix current state with perception
-            alpha = 0.1  # Small influence from perception
-            new_states = (1 - alpha) * current_states + alpha * perception_outputs.repeat(1, channels // perception_outputs.shape[1])
-            
-            # Apply binary threshold for hard updates
-            if hard:
-                new_states = (new_states > 0.5).float()
-        
-        # Reshape back to grid
-        self.state = nn.Parameter(new_states.reshape(height, width, channels))
+        self.state = nn.Parameter(new_state)
     
     def run_ca(self, steps=None, hard=False):
         """Run CA for multiple steps"""
@@ -429,20 +417,39 @@ class DiffLogicCAImage(DifferentiableImage):
 
     def decode_tensor(self):
         """
-        Convert the CA state to an RGB image tensor.
-        Make sure this matches what Pytti expects.
+        Convert the CA state to a standard RGB image tensor.
         """
-        # Take the first rgb_channels of the state as RGB values
+        # Take the first rgb_channels (should be 3) of the state as RGB values
         rgb_values = self.state[..., :self.rgb_channels]
         
-        # Binary operations are extremely fast, but produce only binary images
-        # For smoother display, we can dither or use the raw values 
         # Convert from (height, width, channels) to (channels, height, width)
         rgb_tensor = rgb_values.permute(2, 0, 1)
         
-        # Make sure values are between 0 and 1
+        # Make sure values are between 0 and 1 and exactly 3 channels
         rgb_tensor = rgb_tensor.clamp(0, 1)
         
+        # Ensure we have exactly 3 channels for RGB
+        if rgb_tensor.shape[0] != 3:
+            # If we have more or fewer than 3 channels, fix it
+            if rgb_tensor.shape[0] > 3:
+                rgb_tensor = rgb_tensor[:3]  # Take first 3 channels
+            else:
+                # If fewer than 3, duplicate the last channel
+                channels_to_add = 3 - rgb_tensor.shape[0]
+                last_channel = rgb_tensor[-1:].expand(channels_to_add, *rgb_tensor.shape[1:])
+                rgb_tensor = torch.cat([rgb_tensor, last_channel], dim=0)
+        
+        return rgb_tensor
+
+    def get_image_for_display(self):
+        """
+        Get image in the format expected by the 3D system.
+        """
+        # Get standard RGB tensor
+        rgb_tensor = self.decode_tensor()
+        
+        # Ensure it's in the format expected by the depth model
+        # The depth model expects a standard RGB image
         return rgb_tensor
 
     def train(self, i, prompts, interp_prompts, loss_augs, interp_steps=0):
@@ -459,13 +466,6 @@ class DiffLogicCAImage(DifferentiableImage):
         
         # Process each prompt
         for prompt in prompts:
-            # Format inputs for this prompt
-            formatted_inputs = {
-                'embeds': None,
-                'offsets': None,
-                'sizes': None
-            }
-            
             # Calculate loss for this prompt
             loss = prompt(z)
             losses[prompt] = loss
