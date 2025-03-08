@@ -1,5 +1,6 @@
 from pytti import *
 from pytti.Image import DifferentiableImage
+from pytti.Image.RGBImage import RGBImage  # Import the known working version
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -7,44 +8,67 @@ from torchvision.transforms import functional as TF
 from PIL import Image
 import numpy as np
 
-class GNCAImage(DifferentiableImage):
+class GNCAImage(RGBImage):
     """
-    Very simple image class compatible with Pytti.
-    Follows RGBImage's pattern which is known to work.
+    GNCA image that extends the known-working RGBImage class
     """
     
     @vram_usage_mode('GNCA Image')
-    def __init__(self, width, height, scale=1, channel_n=16, device=DEVICE):
-        super().__init__(width, height)
-        self.scale = scale
+    def __init__(self, width, height, scale=1, device=DEVICE):
+        # Just use RGBImage as the base
+        super().__init__(width, height, scale, device)
         
-        # Simple tensor with batch dimension - crucial for channels_last format!
-        # Using NCHW format: [1, 3, height, width]
-        self.tensor = nn.Parameter(torch.zeros(1, 3, height, width, device=device))
-        
-        # Initialize with gradients
-        self.reset_state()
-        
-        # Animation parameters
+        # Add our own parameters
         self.steps_per_update = 1
+        
+        # Initialize with a pattern
+        self.init_pattern()
+    
+    def init_pattern(self):
+        """Initialize with a pretty pattern"""
+        with torch.no_grad():
+            h, w = self.image_shape
+            
+            # Create coordinate grids
+            y = torch.linspace(0, 1, h).view(-1, 1).expand(-1, w).to(self.tensor.device)
+            x = torch.linspace(0, 1, w).view(1, -1).expand(h, -1).to(self.tensor.device)
+            
+            # Create interesting patterns
+            r = torch.sin(x * 6.28) * 0.5 + 0.5  # Red channel
+            g = torch.sin(y * 6.28) * 0.5 + 0.5  # Green channel
+            b = torch.sin((x + y) * 4.28) * 0.5 + 0.5  # Blue channel
+            
+            # Assign to tensor (keeping NCHW format)
+            self.tensor[0, 0] = r
+            self.tensor[0, 1] = g
+            self.tensor[0, 2] = b
     
     def set_steps_per_update(self, steps):
-        """Configure animation speed"""
+        """Set animation speed"""
         self.steps_per_update = steps
     
-    def reset_state(self):
-        """Initialize with a gradient pattern"""
-        with torch.no_grad():
-            h, w = self.tensor.shape[2:]
+    @torch.no_grad()
+    def update(self):
+        """Add subtle animation"""
+        # Call the parent update first
+        super().update()
+        
+        # Additional animation effects
+        for _ in range(self.steps_per_update):
+            # Apply a simple blur for movement
+            kernel_size = 3
+            kernel = torch.ones(1, 1, kernel_size, kernel_size, device=self.tensor.device) / (kernel_size ** 2)
             
-            # Create a simple gradient pattern
-            y_coords = torch.linspace(0, 1, h).view(1, 1, -1, 1).expand(1, 3, -1, w)
-            x_coords = torch.linspace(0, 1, w).view(1, 1, 1, -1).expand(1, 3, h, -1)
-            
-            # Set RGB channels
-            self.tensor[0, 0] = x_coords[0, 0]  # Red - horizontal gradient
-            self.tensor[0, 1] = y_coords[0, 0]  # Green - vertical gradient
-            self.tensor[0, 2] = 1 - ((x_coords[0, 0] + y_coords[0, 0])/2)  # Blue - diagonal gradient
+            # Process each channel
+            for i in range(3):
+                # Ensure correct shape with batch dimension
+                channel = self.tensor[:, i:i+1]
+                # Apply blur
+                blurred = F.conv2d(channel, kernel, padding=kernel_size//2)
+                # Add noise
+                noise = torch.randn_like(blurred) * 0.01
+                # Update tensor
+                self.tensor[:, i:i+1] = (blurred + noise).clamp(0, 1)
     
     def clone(self):
         """Create a clone of this image"""
@@ -77,22 +101,6 @@ class GNCAImage(DifferentiableImage):
         # Set tensor directly - keeping the batch dimension
         with torch.no_grad():
             self.tensor[0].copy_(img_tensor)
-    
-    @torch.no_grad()
-    def update(self):
-        """Simple update for animation - just a subtle blur"""
-        for _ in range(self.steps_per_update):
-            # Apply a simple blur
-            kernel_size = 3
-            kernel = torch.ones(1, 1, kernel_size, kernel_size, device=self.tensor.device) / (kernel_size ** 2)
-            
-            # Process each channel
-            for i in range(3):
-                channel = self.tensor[:, i:i+1]
-                blurred = F.conv2d(channel, kernel, padding=kernel_size//2)
-                # Add a small perturbation
-                noise = torch.randn_like(blurred) * 0.01
-                self.tensor[:, i:i+1] = (blurred + noise).clamp(0, 1)
     
     @torch.no_grad()
     def decode_image(self):
