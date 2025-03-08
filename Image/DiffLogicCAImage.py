@@ -305,29 +305,28 @@ class DiffLogicCAImage(DifferentiableImage):
         self.state[..., :self.rgb_channels] = rgb
     
     def step(self, hard=False):
-        """Run one CA update step"""
-        batch_size = self.height * self.width
+        """Run one CA update step (optimized version)"""
         height, width, channels = self.state.shape
         
-        # Vectorized neighborhood extraction using unfold
-        state_chw = self.state.permute(2, 0, 1).unsqueeze(0)  # [1, C, H, W]
-        padded = F.pad(state_chw, [1, 1, 1, 1], mode='replicate')
-        unfold = nn.Unfold(kernel_size=3, padding=0)
-        neighborhoods = unfold(padded)  # [1, C*9, H*W]
-        neighborhoods = neighborhoods.view(channels, 9, -1).permute(2, 0, 1)  # [H*W, C, 9]
-        neighborhoods = neighborhoods.reshape(-1, channels, 3, 3)  # [batch, C, 3, 3]
+        # Create padded tensor - channels first for easier neighborhood extraction
+        padded = F.pad(self.state.permute(2, 0, 1), [1, 1, 1, 1], mode='replicate')
         
-        # Collect perception outputs - each kernel now guarantees a (batch, 1) output
-        perception_outputs_list = []
+        # Extract neighborhoods efficiently with unfold
+        # This creates a tensor of shape [channels, height, width, 3, 3]
+        patches = padded.unfold(1, 3, 1).unfold(2, 3, 1)
+        
+        # Reshape to [batch, channels, 3, 3] where batch = height*width
+        neighborhoods = patches.permute(1, 2, 0, 3, 4).reshape(height*width, channels, 3, 3)
+        
+        # Apply perception kernels
+        perception_outputs = []
         for kernel in self.perception_kernels:
-            out = kernel(neighborhoods, hard)  # This will be (batch, 1)
-            perception_outputs_list.append(out)
+            perception_outputs.append(kernel(neighborhoods, hard))
         
-        # Concatenate along feature dimension
-        perception_outputs = torch.cat(perception_outputs_list, dim=1)  # (batch, num_kernels)
+        perception_outputs = torch.stack(perception_outputs, dim=1)  # [batch, num_kernels]
         
         # Current cell states
-        current_states = self.state.reshape(batch_size, channels)
+        current_states = self.state.reshape(height*width, channels)
         
         # Update states
         new_states = self.update_circuit(perception_outputs, current_states, hard)
@@ -351,8 +350,10 @@ class DiffLogicCAImage(DifferentiableImage):
     
     @torch.no_grad()
     def update(self):
-        """Run the CA and update the image"""
-        self.run_ca(hard=True)  # Use hard (discrete) inference
+        """Run the CA and update the image - called by Pytti system"""
+        # Run just one step in the update to make it more responsive
+        # The system will call this repeatedly
+        self.step(hard=True)
     
     def encode_image(self, pil_image, smart_encode=True, device=DEVICE):
         """Convert a PIL image to CA state"""
@@ -404,11 +405,13 @@ class DiffLogicCAImage(DifferentiableImage):
     def decode_tensor(self):
         """
         Convert the CA state to an RGB image tensor.
-        Returns a decoded tensor of this image.
+        Make sure this matches what Pytti expects.
         """
         # Take the first rgb_channels of the state as RGB values
         rgb_values = self.state[..., :self.rgb_channels]
         
+        # Binary operations are extremely fast, but produce only binary images
+        # For smoother display, we can dither or use the raw values 
         # Convert from (height, width, channels) to (channels, height, width)
         rgb_tensor = rgb_values.permute(2, 0, 1)
         
@@ -416,6 +419,19 @@ class DiffLogicCAImage(DifferentiableImage):
         rgb_tensor = rgb_tensor.clamp(0, 1)
         
         return rgb_tensor
+
+    def train(self, i, prompts, interp_prompts, loss_augs, interp_steps=0):
+        """
+        Integration with Pytti's training loop.
+        This method is called by the DirectImageGuide to update the image based on prompts.
+        """
+        # Run a CA step (normal optimizer would update pixels here)
+        self.step(hard=False)  # Use soft logic during training
+        
+        # Return a dummy loss for Pytti's benefit
+        losses = {'TOTAL': 0.0}
+        
+        return losses
 
 def init_difflogic_ca():
     """
