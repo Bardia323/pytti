@@ -288,6 +288,14 @@ class DiffLogicCAImage(DifferentiableImage):
         # Pre-compute a depth map for 3D mode
         self._depth_map = None
         self._prepare_depth_map()
+        
+        # Apply our patch to handle depth processing
+        if ANIMATION_MODE == "3D":
+            try:
+                self._patch_depth_loss()
+            except Exception as e:
+                print(f"Warning: Could not patch depth processing: {e}")
+                print("3D animations may not work properly.")
     
     def _prepare_depth_map(self):
         """Generate a simple depth map for 3D animation"""
@@ -480,12 +488,19 @@ class DiffLogicCAImage(DifferentiableImage):
     def decode_image(self):
         """
         Override the default decode_image method to ensure proper PIL image format.
+        This is called by Transforms.py to get the PIL image before depth processing.
         """
         # Use the parent class implementation but with our properly formatted tensor
         tensor = self.decode_tensor()
         tensor = named_rearrange(tensor, self.output_axes, ('y', 'x', 's'))
         array = tensor.mul(255).clamp(0, 255).cpu().detach().numpy().astype(np.uint8)
-        return Image.fromarray(array)
+        pil_image = Image.fromarray(array)
+        
+        # Attach our model to the PIL image for depth processing
+        pil_image._from_difflogic = True
+        pil_image._difflogic_model = self
+        
+        return pil_image
 
     def get_image_for_display(self):
         """
@@ -597,6 +612,43 @@ class DiffLogicCAImage(DifferentiableImage):
         
         return self
 
+    # Monkeypatch the DepthLoss.get_depth method at initialization
+    def _patch_depth_loss(self):
+        """
+        Monkey patch the DepthLoss.get_depth function to use our get_depth method.
+        This is called during initialization to make our model compatible with 3D animations.
+        """
+        from pytti.LossAug import DepthLoss
+        from functools import wraps
+        from types import MethodType
+        
+        # Store original depth method
+        if not hasattr(DepthLoss, '_original_get_depth'):
+            DepthLoss._original_get_depth = DepthLoss.get_depth
+        
+        # Create a new method that checks if the image is a DiffLogicCAImage
+        @wraps(DepthLoss._original_get_depth)
+        def patched_get_depth(pil_image):
+            # Check if this is our PIL image coming from our model
+            # We can identify it by attaching a special attribute to the PIL image
+            if hasattr(pil_image, '_from_difflogic') and pil_image._from_difflogic:
+                # Get the model that created this image
+                if hasattr(pil_image, '_difflogic_model'):
+                    # Use the model's get_depth method
+                    return pil_image._difflogic_model.get_depth(pil_image)
+                # Fallback to a simple gradient
+                height, width = pil_image.size[1], pil_image.size[0]
+                gradient = np.ones((height, width), dtype=np.float32) * 0.5
+                for y in range(height):
+                    gradient[y, :] = 0.3 + 0.4 * (y / height)
+                return gradient, False
+            # Otherwise use the original method
+            return DepthLoss._original_get_depth(pil_image)
+        
+        # Apply the patch
+        DepthLoss.get_depth = patched_get_depth
+        print("Patched DepthLoss.get_depth for DiffLogicCA compatibility")
+
 def init_difflogic_ca(animation_mode="None"):
     """
     Initialize DiffLogicCA system.
@@ -642,11 +694,18 @@ class DiffLogicCAImage2D(DiffLogicCAImage):
         print("Using 2D-compatible DiffLogicCA model (3D animations disabled)")
         
     # Override methods that might be called in 3D mode
-    def get_depth(self, *args, **kwargs):
-        # Don't return a real depth map - this will prevent 3D processing
-        print("Depth requested but not supported in 2D mode")
+    def get_depth(self, pil_image=None):
+        """
+        Return a simpler depth map that won't cause errors with the depth model.
+        This is safer than trying to monkey-patch the system.
+        """
         h, w = self.height, self.width
-        return np.zeros((h, w), dtype=np.float32), False
+        # Create a gradient that looks good for animations
+        depth = np.ones((h, w), dtype=np.float32)
+        # Add gradient with closest at bottom (for typical scenes)
+        for y in range(h):
+            depth[y, :] = 0.1 + 0.8 * (1 - y / h)
+        return depth, False
     
     def get_latent_tensor(self, detach=False):
         # Return a tensor that won't be used for 3D processing
