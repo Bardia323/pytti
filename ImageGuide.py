@@ -308,6 +308,10 @@ class EnhancedImageGuide(DirectImageGuide):
         # Skip if not enough components have stats
         if len(loss_stats) < 2:
             return
+
+        # We need to delay weight updates until after backward() to avoid autograd errors
+        # Store the weights to update after backward
+        self.weights_to_update = []
         
         # Adjust weights - increase weight for smaller losses, decrease for larger ones
         for prompt, loss in prompt_losses.items():
@@ -338,20 +342,8 @@ class EnhancedImageGuide(DirectImageGuide):
                     # Don't let weight go below 20% or above 500% of initial
                     new_weight = max(min(new_weight, init_weight_val * 5.0), init_weight_val * 0.2)
                     
-                    try:
-                        # Check if the weight needs to be an integer
-                        if hasattr(prompt.weight, 'dtype') and prompt.weight.dtype == torch.int64:
-                            new_weight = int(new_weight)
-                        
-                        # Check if set_weight needs device parameter
-                        import inspect
-                        sig = inspect.signature(prompt.set_weight)
-                        if len(sig.parameters) == 1:
-                            prompt.set_weight(new_weight)
-                        else:
-                            prompt.set_weight(new_weight, DEVICE)
-                    except Exception as e:
-                        print(f"Warning: Could not set weight for {prompt}: {e}")
+                    # Save for later application after backward pass
+                    self.weights_to_update.append((prompt, new_weight))
         
         # Same for augmentation losses
         for aug, loss in {**aug_losses, **image_losses}.items():
@@ -379,20 +371,36 @@ class EnhancedImageGuide(DirectImageGuide):
                     # Don't let weight go below 20% or above 500% of initial
                     new_weight = max(min(new_weight, init_weight_val * 5.0), init_weight_val * 0.2)
                     
-                    try:
-                        # Check if the weight needs to be an integer
-                        if hasattr(aug.weight, 'dtype') and aug.weight.dtype == torch.int64:
-                            new_weight = int(new_weight)
-                        
-                        # Check if set_weight needs device parameter
-                        import inspect
-                        sig = inspect.signature(aug.set_weight)
-                        if len(sig.parameters) == 1:
-                            aug.set_weight(new_weight)
-                        else:
-                            aug.set_weight(new_weight, DEVICE)
-                    except Exception as e:
-                        print(f"Warning: Could not set weight for {aug}: {e}")
+                    # Save for later application after backward pass
+                    self.weights_to_update.append((aug, new_weight))
+
+    def _apply_weight_updates(self):
+        """Apply weight updates after backward pass to avoid autograd errors"""
+        if not hasattr(self, 'weights_to_update') or not self.weights_to_update:
+            return
+            
+        for obj, new_weight in self.weights_to_update:
+            try:
+                # Check if the weight needs to be an integer
+                if hasattr(obj.weight, 'dtype') and obj.weight.dtype == torch.int64:
+                    new_weight = int(new_weight)
+                
+                # Get the number of arguments expected by set_weight
+                sig = inspect.signature(obj.set_weight)
+                num_params = len(sig.parameters)
+                
+                # Only call with the right number of arguments
+                if num_params == 1:
+                    obj.set_weight(new_weight)
+                elif num_params == 2 and 'device' in str(sig):
+                    obj.set_weight(new_weight, DEVICE)
+                else:
+                    print(f"Warning: Cannot set weight for {obj}, unexpected number of parameters ({num_params})")
+            except Exception as e:
+                print(f"Warning: Could not set weight for {obj}: {e}")
+                
+        # Clear the list
+        self.weights_to_update = []
     
     def train(self, i, prompts, interp_prompts, loss_augs, interp_steps=0, save_loss=True):
         """Performs a training step with adaptive weight adjustment."""
@@ -457,7 +465,8 @@ class EnhancedImageGuide(DirectImageGuide):
         if self.adaptive_weights:
             self._store_initial_weights(prompt_losses, aug_losses, image_losses)
             
-        # Update weights adaptively if enabled
+        # Update weights adaptively if enabled - this now just calculates new weights
+        # but doesn't apply them yet to avoid autograd errors
         self._update_loss_weights(i, prompt_losses, aug_losses, image_losses)
 
         # Aggregate losses
@@ -477,8 +486,16 @@ class EnhancedImageGuide(DirectImageGuide):
             else:
                 self.dataframe[0] = pd.concat([self.dataframe[0], pd.DataFrame(loss_dict, index=[i])])
 
+        # First do the backward pass
         total_loss.backward()
+        
+        # Apply the optimizer step
         self.optimizer.step()
+        
+        # Now it's safe to apply weight updates after backward and optimizer steps
+        if self.adaptive_weights:
+            self._apply_weight_updates()
+            
         self.image_rep.update()
 
         return {'TOTAL': float(total_loss)}
