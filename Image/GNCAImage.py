@@ -1,196 +1,15 @@
+                for j in range(self.pallet_size):
+                    brightness = j / max(1, self.pallet_size - 1)
+                    # Convert HSV to RGB - avoiding extreme saturation
+                    h = hue
+                    s = 0.6  # moderate saturation
+                    v = 0.3 + brightness * 0.7  # avoid pure black
+                    
+                    # Simple HSV to RGB
+                    c = v * s
+                    x = c * (1 - abs((h * 6) % 2 - 1))
+                    m = v - c
 from pytti import *
-from pytti.Image import DifferentiableImage
-from pytti.Image.RGBImage import RGBImage  # Import the known working version
-from pytti.LossAug import HSVLoss
-from pytti.ImageGuide import DirectImageGuide
-from pytti.Image.PixelImage import HdrLoss, PalletLoss
-import torch
-from torch import nn, optim
-from torch.nn import functional as F
-from torchvision.transforms import functional as TF
-from PIL import Image
-import numpy as np
-
-class CAModel(nn.Module):
-    """Neural network for CA updates with stronger visual effects"""
-    def __init__(self, hidden_channels=32):
-        super().__init__()
-        self.hidden_channels = hidden_channels
-        
-        # Perception network
-        self.perception = nn.Sequential(
-            nn.Conv2d(3, hidden_channels, kernel_size=3, padding=1),
-            nn.LeakyReLU(0.2),
-            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1),
-            nn.LeakyReLU(0.2),
-        )
-        
-        # Update network - stronger updates
-        self.update = nn.Sequential(
-            nn.Conv2d(hidden_channels + 3 + 3, hidden_channels, kernel_size=1),
-            nn.LeakyReLU(0.2),
-            nn.Conv2d(hidden_channels, 3, kernel_size=1),
-            nn.Tanh(),
-        )
-    
-    def forward(self, current_state, clip_gradients, step_size=0.3):
-        """
-        current_state: [B, 3, H, W] tensor of current RGB values
-        clip_gradients: [B, 3, H, W] tensor of gradients from CLIP loss
-        step_size: How strong the updates should be (higher = more visible)
-        """
-        # Perceive local patterns
-        perception_features = self.perception(current_state)
-        
-        # Normalize clip gradients
-        norm_grad = clip_gradients / (clip_gradients.std() + 1e-8) * 0.2
-        
-        # Concatenate features, current state, and gradients
-        combined = torch.cat([perception_features, current_state, norm_grad], dim=1)
-        
-        # Compute update with stronger effect
-        update_values = self.update(combined)
-        
-        # Apply update with larger step size for visibility
-        new_state = current_state + update_values * step_size
-        
-        return new_state.clamp(0, 1)
-
-# Compile frequently called function with TorchScript for speed
-@torch.jit.script
-def break_tensor(tensor):
-    floors = tensor.floor().long()
-    ceils = tensor.ceil().long()
-    rounds = tensor.round().long()
-    fracs = tensor - floors
-    return floors, ceils, rounds, fracs
-
-class PalletLoss(nn.Module):
-    def __init__(self, n_pallets, weight=0.15, device=DEVICE):
-        super().__init__()
-        self.n_pallets = n_pallets
-        # Explicitly set type to float32
-        self.register_buffer('weight', torch.as_tensor(weight, dtype=torch.float32, device=device))
-
-    def forward(self, input):
-        if isinstance(input, GNCAImage):
-            tensor = input.tensor.movedim(0, -1).contiguous().view(-1, self.n_pallets)
-            tensor = F.softmax(tensor, dim=-1)
-            N, n = tensor.shape
-            mu = tensor.mean(dim=0, keepdim=True)
-            epsilon = 1e-8
-            sigma = tensor.std(dim=0, keepdim=True) + epsilon
-            tensor_centered = tensor - mu
-            S = (tensor_centered.transpose(0, 1) @ tensor_centered).div(sigma * sigma.transpose(0, 1) * N)
-            S = S - torch.diag(S.diagonal())
-            loss_raw = S.mean()
-            loss_raw = loss_raw + sigma.mul(N).pow(-1).mean()
-            return loss_raw * self.weight, loss_raw
-        else:
-            return 0, 0
-
-    @torch.no_grad()
-    def set_weight(self, weight, device=DEVICE):
-        # Ensure the weight is a float32 tensor
-        self.weight.set_(torch.as_tensor(weight, dtype=torch.float32, device=device))
-
-    def __str__(self):
-        return "Palette normalization"
-
-class HdrLoss(nn.Module):
-    def __init__(self, pallet_size, n_pallets, gamma=2.5, weight=0.15, device=DEVICE):
-        super().__init__()
-        self.register_buffer('comp', torch.linspace(0, 1, pallet_size).pow(gamma).view(pallet_size, 1).repeat(1, n_pallets).to(device))
-        # Explicitly set type to float32
-        self.register_buffer('weight', torch.as_tensor(weight, dtype=torch.float32, device=device))
-
-    def forward(self, input):
-        if isinstance(input, GNCAImage):
-            pallet = input.sort_pallet()
-            magic_color = pallet.new_tensor([[[0.299, 0.587, 0.114]]])
-            color_norms = torch.linalg.vector_norm(pallet * magic_color.sqrt(), dim=-1)
-            loss_raw = F.mse_loss(color_norms, self.comp)
-            return loss_raw * self.weight, loss_raw
-        else:
-            return 0, 0
-
-    @torch.no_grad()
-    def set_weight(self, weight, device=DEVICE):
-        # Ensure the weight is a float32 tensor
-        self.weight.set_(torch.as_tensor(weight, dtype=torch.float32, device=device))
-
-    def __str__(self):
-        return "HDR normalization"
-
-class GNCAImage(DifferentiableImage):
-    """
-    GNCA-based image with palette support for color stability
-    """
-    
-    @vram_usage_mode('GNCA Palette Image')
-    def __init__(self, width, height, scale=1, pallet_size=8, n_pallets=8, 
-                 gamma=1, hdr_weight=0.5, norm_weight=0.1, device=DEVICE):
-        super().__init__(width * scale, height * scale)
-        
-        # Palette parameters
-        self.pallet_inertia = 2
-        pallet = torch.linspace(0, self.pallet_inertia, pallet_size).pow(gamma).view(pallet_size, 1, 1).repeat(1, n_pallets, 3)
-        self.pallet = nn.Parameter(pallet.to(device, dtype=torch.float32))
-        self.pallet_size = pallet_size
-        self.n_pallets = n_pallets
-        
-        # Value and tensor parameters (like PixelImage)
-        self.value = nn.Parameter(torch.zeros(height, width, dtype=torch.float32, device=device))
-        self.tensor = nn.Parameter(torch.zeros(n_pallets, height, width, dtype=torch.float32, device=device))
-        
-        # GNCA parameters
-        self.scale = scale
-        self.steps_per_update = 1
-        self.update_mode = 'grow'  # 'grow' or 'none'
-        
-        # Register buffers for CA state
-        self.register_buffer('alive_mask', torch.zeros(1, height, width, device=device))
-        self.register_buffer('grad_buffer', torch.zeros_like(self.tensor))
-        self.register_buffer('pallet_target', torch.empty_like(self.pallet))
-        self.use_pallet_target = False
-        
-        # Output format
-        self.output_axes = ('n', 's', 'y', 'x')
-        self.latent_strength = 0.1
-        
-        # Loss functions like PixelImage
-        self.hdr_loss = HdrLoss(pallet_size, n_pallets, gamma, hdr_weight) if hdr_weight != 0 else None
-        self.loss = PalletLoss(n_pallets, norm_weight)
-        
-        # Initialize with a pattern
-        self.reset_state()
-    
-    def clone(self):
-        """Create a clone of this image"""
-        width, height = self.image_shape
-        dummy = GNCAImage(width // self.scale, height // self.scale, self.scale, self.pallet_size, self.n_pallets,
-                          hdr_weight=0 if self.hdr_loss is None else float(self.hdr_loss.weight),
-                          norm_weight=float(self.loss.weight))
-        with torch.no_grad():
-            dummy.value.copy_(self.value)
-            dummy.tensor.copy_(self.tensor)
-            dummy.pallet.copy_(self.pallet)
-            dummy.alive_mask.copy_(self.alive_mask)
-            dummy.grad_buffer.copy_(self.grad_buffer)
-            dummy.pallet_target.copy_(self.pallet_target)
-            dummy.use_pallet_target = self.use_pallet_target
-            dummy.steps_per_update = self.steps_per_update
-            dummy.update_mode = self.update_mode
-        return dummy
-    
-    def reset_state(self):
-        """Initialize with a basic pattern"""
-        with torch.no_grad():
-            # Initialize palette with smooth gradient
-            for i in range(self.n_pallets):
-                self.pallet[:, i, 0] = torch.linspace(0.2, 0.8, self.pallet_size)  # Red
-                self.pallet[:, i, 1] = torch.linspace(0.8, 0.2, self.pallet_size)  # Green
-                self.pallet[:, i, 2] = torch.sin(torch.linspace(0, 3.14, self.pallet_size)) * 0.5 + 0.5  # Blue
             
             # Create a simple pattern
             h, w = self.value.shape
@@ -201,7 +20,7 @@ class GNCAImage(DifferentiableImage):
             dist = torch.sqrt((x - 0.5)**2 + (y - 0.5)**2).clamp(0, 1)
             self.value.copy_(dist)
             
-            # Initialize palette weights for center region
+            # Initialize palette weights
             self.tensor.zero_()
             center_size = min(h, w) // 4
             cy, cx = h//2, w//2
@@ -218,7 +37,7 @@ class GNCAImage(DifferentiableImage):
                 x_start, x_end = max(0, x_start), min(w, x_end)
                 
                 if y_end > y_start and x_end > x_start:
-                    self.tensor[i, y_start:y_end, x_start:x_end] = 1.0
+                    self.tensor[i, y_start:y_end, x_start:x_end] = 2.0  # Less extreme value
             
             # Initialize alive mask in center
             self.alive_mask.zero_()
@@ -275,7 +94,7 @@ class GNCAImage(DifferentiableImage):
         self.tensor.copy_(tensor[1:])
     
     def decode_tensor(self):
-        """Convert to RGB tensor (like PixelImage, but simplified)"""
+        """Convert to RGB tensor in the expected format for CLIP"""
         width, height = self.image_shape
         pallet = self.sort_pallet()
         
@@ -292,14 +111,18 @@ class GNCAImage(DifferentiableImage):
         colors_cont = pallet[value_floors] * (1 - value_fracs) + pallet[value_ceils] * value_fracs
         colors_cont = (colors_cont * pallet_weights).sum(dim=2)
         
-        # Resize to final dimensions
-        colors_cont = F.interpolate(
-            colors_cont.permute(2, 0, 1).unsqueeze(0),
-            size=(height, width),
-            mode='nearest'
-        ).squeeze(0)
+        # Resize to final dimensions if needed
+        if self.scale > 1:
+            colors_cont = F.interpolate(
+                colors_cont.permute(2, 0, 1).unsqueeze(0),
+                size=(height, width),
+                mode='nearest'
+            ).squeeze(0)
+        else:
+            colors_cont = colors_cont.permute(2, 0, 1)
         
-        return colors_cont
+        # Ensure tensor is in the correct format (C,H,W) and properly clamped
+        return colors_cont.clamp(0, 1)
     
     def encode_image(self, pil_image, smart_encode=True, device=DEVICE):
         """Encode from PIL image with palette (like PixelImage)"""
@@ -449,6 +272,24 @@ class GNCAImage(DifferentiableImage):
     @torch.no_grad()
     def render_pallet(self):
         """Render palette for visualization (like PixelImage)"""
+        pallet = self.sort_pallet()
+        width, height = self.n_pallets * 16, self.pallet_size * 32
+        array = (pallet.mul(255).clamp(0, 255).cpu().numpy().astype(np.uint8))
+        return Image.fromarray(array).resize((width, height), Image.NEAREST)
+    
+    @torch.no_grad()
+    def decode_image(self):
+        """Convert to PIL image for display"""
+        tensor = self.decode_tensor()
+        array = (tensor.permute(1, 2, 0).mul(255).clamp(0, 255).cpu().numpy().astype(np.uint8))
+        return Image.fromarray(array)
+        array = (tensor.permute(1, 2, 0).mul(255).clamp(0, 255).cpu().numpy().astype(np.uint8))
+        return Image.fromarray(array)
+    def decode_image(self):
+        """Convert to PIL image for display"""
+        tensor = self.decode_tensor()
+        array = (tensor.permute(1, 2, 0).mul(255).clamp(0, 255).cpu().numpy().astype(np.uint8))
+        return Image.fromarray(array)
         pallet = self.sort_pallet()
         width, height = self.n_pallets * 16, self.pallet_size * 32
         array = (pallet.mul(255).clamp(0, 255).cpu().numpy().astype(np.uint8))
