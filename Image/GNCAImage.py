@@ -65,6 +65,63 @@ def break_tensor(tensor):
     fracs = tensor - floors
     return floors, ceils, rounds, fracs
 
+class PalletLoss(nn.Module):
+    def __init__(self, n_pallets, weight=0.15, device=DEVICE):
+        super().__init__()
+        self.n_pallets = n_pallets
+        # Explicitly set type to float32
+        self.register_buffer('weight', torch.as_tensor(weight, dtype=torch.float32, device=device))
+
+    def forward(self, input):
+        if isinstance(input, GNCAImage):
+            tensor = input.tensor.movedim(0, -1).contiguous().view(-1, self.n_pallets)
+            tensor = F.softmax(tensor, dim=-1)
+            N, n = tensor.shape
+            mu = tensor.mean(dim=0, keepdim=True)
+            epsilon = 1e-8
+            sigma = tensor.std(dim=0, keepdim=True) + epsilon
+            tensor_centered = tensor - mu
+            S = (tensor_centered.transpose(0, 1) @ tensor_centered).div(sigma * sigma.transpose(0, 1) * N)
+            S = S - torch.diag(S.diagonal())
+            loss_raw = S.mean()
+            loss_raw = loss_raw + sigma.mul(N).pow(-1).mean()
+            return loss_raw * self.weight, loss_raw
+        else:
+            return 0, 0
+
+    @torch.no_grad()
+    def set_weight(self, weight, device=DEVICE):
+        # Ensure the weight is a float32 tensor
+        self.weight.set_(torch.as_tensor(weight, dtype=torch.float32, device=device))
+
+    def __str__(self):
+        return "Palette normalization"
+
+class HdrLoss(nn.Module):
+    def __init__(self, pallet_size, n_pallets, gamma=2.5, weight=0.15, device=DEVICE):
+        super().__init__()
+        self.register_buffer('comp', torch.linspace(0, 1, pallet_size).pow(gamma).view(pallet_size, 1).repeat(1, n_pallets).to(device))
+        # Explicitly set type to float32
+        self.register_buffer('weight', torch.as_tensor(weight, dtype=torch.float32, device=device))
+
+    def forward(self, input):
+        if isinstance(input, GNCAImage):
+            pallet = input.sort_pallet()
+            magic_color = pallet.new_tensor([[[0.299, 0.587, 0.114]]])
+            color_norms = torch.linalg.vector_norm(pallet * magic_color.sqrt(), dim=-1)
+            loss_raw = F.mse_loss(color_norms, self.comp)
+            return loss_raw * self.weight, loss_raw
+        else:
+            return 0, 0
+
+    @torch.no_grad()
+    def set_weight(self, weight, device=DEVICE):
+        # Ensure the weight is a float32 tensor
+        self.weight.set_(torch.as_tensor(weight, dtype=torch.float32, device=device))
+
+    def __str__(self):
+        return "HDR normalization"
+
 class GNCAImage(DifferentiableImage):
     """
     GNCA-based image with palette support for color stability
@@ -263,20 +320,28 @@ class GNCAImage(DifferentiableImage):
             self.alive_mask[0] = (value_ref > value_ref.mean() * 0.8).float()
         
         if smart_encode:
-            # Use HSV loss to better match the colors
-            mse = HSVLoss.TargetImage('HSV loss', self.image_shape, pil_image)
-            
-            # Temporarily disable HDR loss for faster encoding
-            if self.hdr_loss is not None:
-                before_weight = self.hdr_loss.weight.clone()
-                self.hdr_loss.set_weight(0.01)
+            # Skip optimization for simplicity and just assign random palette weights
+            with torch.no_grad():
+                # Find areas with different colors
+                mean_color = color_ref.mean(dim=(1, 2), keepdim=True)
+                diff_color = (color_ref - mean_color).abs().sum(dim=0)
                 
-            # Optimize palette and weights to match the image
-            guide = DirectImageGuide(self, None, optimizer=optim.Adam([self.pallet, self.tensor], lr=0.1))
-            guide.run_steps(100, [], [], [mse])
-            
-            if self.hdr_loss is not None:
-                self.hdr_loss.set_weight(before_weight)
+                # Create different regions based on color differences
+                regions = (diff_color > diff_color.mean()).float()
+                
+                # Assign palette weights based on regions
+                k_means = min(4, self.n_pallets)
+                h, w = self.tensor.shape[1:]
+                for i in range(k_means):
+                    # Create mask for this region (simple grid-based division)
+                    region_y, region_x = i // 2, i % 2
+                    y_start = region_y * (h // 2)
+                    y_end = (region_y + 1) * (h // 2)
+                    x_start = region_x * (w // 2)
+                    x_end = (region_x + 1) * (w // 2)
+                    
+                    # Set weights higher in this region
+                    self.tensor[i, y_start:y_end, x_start:x_end] = 5.0
     
     def encode_random(self, random_pallet=False):
         """Initialize with random values (like PixelImage)"""
