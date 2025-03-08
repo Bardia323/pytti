@@ -37,7 +37,9 @@ class CAModel(nn.Module):
         batch_size, c, h, w = x.shape
         
         # Simple method: process each channel separately
-        results = []
+        identity_out = []
+        dx_out = []
+        dy_out = []
         
         # Apply rotation if needed
         if angle != 0.0:
@@ -53,16 +55,17 @@ class CAModel(nn.Module):
             x_ch = x[:, i:i+1]  # Get one channel at a time
             
             # Apply the three kernels
-            y_id = F.conv2d(x_ch, self.identity, padding=1)
-            y_dx = F.conv2d(x_ch, dx_rotated, padding=1)
-            y_dy = F.conv2d(x_ch, dy_rotated, padding=1)
-            
-            # Concatenate the results for this channel
-            results.append(torch.cat([y_id, y_dx, y_dy], dim=1))
+            identity_out.append(F.conv2d(x_ch, self.identity, padding=1))
+            dx_out.append(F.conv2d(x_ch, dx_rotated, padding=1))
+            dy_out.append(F.conv2d(x_ch, dy_rotated, padding=1))
         
-        # Concatenate all channels
-        result = torch.cat(results, dim=1)
-        return result.reshape(batch_size, -1, h, w)
+        # Concatenate the results (batch, channel*perception, h, w)
+        identity_out = torch.cat(identity_out, dim=1)
+        dx_out = torch.cat(dx_out, dim=1)
+        dy_out = torch.cat(dy_out, dim=1)
+        
+        # Stack all perception outputs
+        return torch.cat([identity_out, dx_out, dy_out], dim=1)
     
     def get_living_mask(self, x):
         """Determine which cells are alive based on alpha channel"""
@@ -109,10 +112,12 @@ class GNCAImage(DifferentiableImage):
         # CA state (RGBA + hidden channels)
         self.state = nn.Parameter(torch.zeros(1, channel_n, height, width, device=device))
         
+        # IMPORTANT: Match PixelImage output_axes exactly
+        self.output_axes = ('n', 's', 'y', 'x')  # Not 'c' but 's'!
+        
         # For targeting specific images
         self.target_image = None
         self.use_target = False
-        self.output_axes = ('n', 'c', 'y', 'x')
         self.steps_per_update = 1
         
         # Set the seed (center pixel)
@@ -124,7 +129,16 @@ class GNCAImage(DifferentiableImage):
             self.state.zero_()
             h, w = self.state.shape[2:]
             cx, cy = w // 2, h // 2
-            self.state[0, 3:, cy-1:cy+1, cx-1:cx+1] = 1.0  # Set alive state for seed
+            seed_size = 3  # Larger seed for better visibility
+            x_start, x_end = max(0, cx-seed_size//2), min(w, cx+seed_size//2+1)
+            y_start, y_end = max(0, cy-seed_size//2), min(h, cy+seed_size//2+1)
+            
+            # Initialize RGB to white (visible seed)
+            self.state[0, :3, y_start:y_end, x_start:x_end] = 1.0
+            # Set alpha (life) to 1
+            self.state[0, 3:4, y_start:y_end, x_start:x_end] = 1.0
+            # Set some hidden state for growth potential
+            self.state[0, 4:, y_start:y_end, x_start:x_end] = 0.1
     
     def clone(self):
         """Create a clone of this image"""
@@ -141,6 +155,8 @@ class GNCAImage(DifferentiableImage):
     
     def get_image_tensor(self):
         """Return the inner state tensor - required for transformations"""
+        # The shape must be exactly like what PixelImage returns
+        # PixelImage concatenates value and tensor in channel dimension
         return self.state.squeeze(0)
     
     def set_image_tensor(self, tensor):
