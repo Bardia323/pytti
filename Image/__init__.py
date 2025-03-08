@@ -23,6 +23,7 @@ class DifferentiableImage(nn.Module):
     self.output_axes  = ('x', 'y', 's')
     self.lr = 0.02
     self.latent_strength = 0
+    self.input_axes = ('n', 's', 'y', 'x')
 
   def decode_training_tensor(self):
     """

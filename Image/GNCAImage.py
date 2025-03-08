@@ -8,67 +8,77 @@ from torchvision.transforms import functional as TF
 from PIL import Image
 import numpy as np
 
-class GNCAImage(RGBImage):
+class GNCAImage(DifferentiableImage):
     """
-    GNCA image based on RGBImage
-    Uses simple blur-based animation as a placeholder for full CA
+    GNCA-inspired image class for Pytti
     """
     
     @vram_usage_mode('GNCA Image')
-    def __init__(self, width, height, scale=1, device=DEVICE, **kwargs):
-        # Call parent exactly as in RGBImage
-        super().__init__(width, height, scale, device)
+    def __init__(self, width, height, scale=1, **kwargs):
+        super().__init__(width, height)
+        self.scale = scale
         
-        # Animation speed parameter
+        # Create tensor with batch dimension [batch, channels, height, width]
+        self.tensor = nn.Parameter(torch.zeros(1, 3, height, width, device=DEVICE))
+        
+        # CRITICAL: Set output_axes to match what the embedder expects
+        self.output_axes = ('n', 'c', 'y', 'x')
+        
+        # Animation parameters
         self.steps_per_update = 1
         
-        # Create initial pattern
-        self.init_pattern()
-    
-    def init_pattern(self):
-        """Create initial pattern"""
-        with torch.no_grad():
-            # Get actual tensor dimensions (NCHW format)
-            _, _, h, w = self.tensor.shape
-            
-            # Create simple pattern
-            for i in range(w):
-                for j in range(h):
-                    x, y = i/w, j/h
-                    self.tensor[0, 0, j, i] = ((x + y)/2) % 1.0  # Red
-                    self.tensor[0, 1, j, i] = x % 1.0  # Green
-                    self.tensor[0, 2, j, i] = y % 1.0  # Blue
+        # Initialize with visible pattern
+        self.reset_state()
     
     def reset_state(self):
-        """Compatibility with initialization code"""
-        self.init_pattern()
+        """Reset image state"""
+        with torch.no_grad():
+            # Clear tensor
+            self.tensor.zero_()
+            
+            # Get dimensions
+            _, _, h, w = self.tensor.shape
+            
+            # Create pattern - circular gradient
+            y = torch.linspace(-1, 1, h).view(-1, 1).expand(-1, w)
+            x = torch.linspace(-1, 1, w).view(1, -1).expand(h, -1)
+            
+            # Create circular distance from center
+            dist = torch.sqrt(x.pow(2) + y.pow(2))
+            
+            # Create interesting patterns
+            r = torch.sin(dist * 6.28) * 0.5 + 0.5  # Red channel
+            g = torch.sin(dist * 6.28) * 0.5 + 0.5  # Green channel
+            b = torch.sin(dist * 6.28) * 0.5 + 0.5  # Blue channel
+            
+            # Assign to tensor (keeping NCHW format)
+            self.tensor[0, 0] = r
+            self.tensor[0, 1] = g
+            self.tensor[0, 2] = b
     
     def set_steps_per_update(self, steps):
-        """Animation speed setting"""
+        """Set animation speed"""
         self.steps_per_update = steps
     
     @torch.no_grad()
     def update(self):
-        """Simple animation - blur and add noise"""
+        """Add subtle animation"""
+        # Additional animation effects
         for _ in range(self.steps_per_update):
-            # Make a copy for the update
-            updated = self.tensor.clone()
+            # Apply a simple blur for movement
+            kernel_size = 3
+            kernel = torch.ones(1, 1, kernel_size, kernel_size, device=self.tensor.device) / (kernel_size ** 2)
             
-            # Apply simple 3x3 blur
-            for c in range(3):  # For each RGB channel
-                for i in range(1, self.tensor.shape[3]-1):
-                    for j in range(1, self.tensor.shape[2]-1):
-                        # Simple 3x3 average
-                        neighbors_sum = 0
-                        for di in [-1, 0, 1]:
-                            for dj in [-1, 0, 1]:
-                                neighbors_sum += self.tensor[0, c, j+dj, i+di]
-                        
-                        # Update with blur + small random change
-                        updated[0, c, j, i] = (neighbors_sum / 9.0) + torch.rand(1).item() * 0.02 - 0.01
-            
-            # Update tensor with clipping
-            self.tensor.copy_(updated.clamp(0, 1))
+            # Process each channel
+            for i in range(3):
+                # Ensure correct shape with batch dimension
+                channel = self.tensor[:, i:i+1]
+                # Apply blur
+                blurred = F.conv2d(channel, kernel, padding=kernel_size//2)
+                # Add noise
+                noise = torch.randn_like(blurred) * 0.01
+                # Update tensor
+                self.tensor[:, i:i+1] = (blurred + noise).clamp(0, 1)
     
     def clone(self):
         """Create a clone of this image"""
