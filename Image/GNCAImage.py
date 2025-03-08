@@ -16,12 +16,13 @@ class CAModel(nn.Module):
         self.channel_n = channel_n
         
         # Perception kernels for edge detection (3×3×channel_n)
+        # IMPORTANT: Explicitly put kernels on the specified device
         self.register_buffer('identity', torch.tensor([0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0], 
-                                                    dtype=torch.float32).reshape(1, 1, 3, 3))
+                                   dtype=torch.float32, device=device).reshape(1, 1, 3, 3))
         self.register_buffer('sobel_x', torch.tensor([1.0, 2.0, 1.0, 0.0, 0.0, 0.0, -1.0, -2.0, -1.0], 
-                                              dtype=torch.float32).reshape(1, 1, 3, 3) / 8.0)
+                                   dtype=torch.float32, device=device).reshape(1, 1, 3, 3) / 8.0)
         self.register_buffer('sobel_y', torch.tensor([1.0, 0.0, -1.0, 2.0, 0.0, -2.0, 1.0, 0.0, -1.0], 
-                                              dtype=torch.float32).reshape(1, 1, 3, 3) / 8.0)
+                                   dtype=torch.float32, device=device).reshape(1, 1, 3, 3) / 8.0)
         
         # Neural update network (fully differentiable)
         self.update_net = nn.Sequential(
@@ -130,8 +131,8 @@ class GNCAImage(DifferentiableImage):
             # Set RGB to white
             self.state[0, 0:3, cy-seed_size//2:cy+seed_size//2, cx-seed_size//2:cx+seed_size//2] = 1.0
             
-            # Set alpha to alive
-            self.state[0, 3:4, cy-seed_size//2:cy+seed_size//2, cx-seed_size//2:cx+seed_size//2] = 1.0
+            # Set alpha to alive (using logits, so >0 means alive)
+            self.state[0, 3:4, cy-seed_size//2:cy+seed_size//2, cx-seed_size//2:cx+seed_size//2] = 5.0  # Strong positive for definitely alive
             
             # Set some hidden state
             if self.channel_n > 4:
@@ -152,15 +153,17 @@ class GNCAImage(DifferentiableImage):
     
     def decode_tensor(self):
         """Returns RGB tensor for display"""
-        # Extract RGB from state and apply alpha premultiplication
+        # Extract RGB from state and apply alpha for display
         rgb = self.state[0, 0:3]
+        
+        # Alpha is stored as logits, convert to probability with sigmoid
         alpha = torch.sigmoid(self.state[0, 3:4])
         
         # Background color (white)
         bg_color = torch.ones_like(rgb)
         
-        # Composite with white background
-        composite = alpha * rgb + (1 - alpha) * bg_color
+        # Composite with white background (fix for inversion)
+        composite = rgb * alpha + bg_color * (1 - alpha)
         
         return composite
     
@@ -195,13 +198,18 @@ class GNCAImage(DifferentiableImage):
             
             # Set alpha based on brightness (bright areas = alive)
             brightness = img_tensor.mean(dim=0, keepdim=True)
-            alpha = (brightness > 0.2).float() * 2.0 - 1.0  # Convert to logits
-            self.state[0, 3:4].copy_(alpha)
+            
+            # Convert to logits: values > 0.2 become alive (>0 in logit space)
+            # Using strong logit values for clearer separation
+            alpha_mask = (brightness > 0.2).float()
+            alpha_logits = alpha_mask * 5.0 - (1.0 - alpha_mask) * 5.0  # 5.0 for alive, -5.0 for dead
+            
+            self.state[0, 3:4].copy_(alpha_logits)
             
             # Initialize hidden state in alive areas
             if self.channel_n > 4 and smart_encode:
                 # Make sure alive_mask has correct shape: [h, w] not [1, h, w]
-                alive_mask = (brightness > 0.2).float().squeeze(0)  # Remove extra dim
+                alive_mask = alpha_mask.squeeze(0)  # Remove extra dim
                 target_device = self.state.device
                 
                 for i in range(4, self.channel_n):
@@ -221,9 +229,10 @@ class GNCAImage(DifferentiableImage):
             self.state[0, 0:3].uniform_(0, 1)
             
             # Random alive areas (sparse)
-            alpha = torch.zeros_like(self.state[0, 3:4])
-            alpha.bernoulli_(0.1)  # 10% alive cells
-            self.state[0, 3:4] = alpha * 2.0 - 1.0  # Convert to logits
+            alive_mask = torch.zeros_like(self.state[0, 3:4])
+            alive_mask.bernoulli_(0.1)  # 10% alive cells
+            alpha_logits = alive_mask * 5.0 - (1.0 - alive_mask) * 5.0  # Strong logits
+            self.state[0, 3:4].copy_(alpha_logits)
             
             # Random hidden state
             if self.channel_n > 4:
