@@ -1,8 +1,10 @@
 from pytti import *
 from pytti.Image import DifferentiableImage
 from pytti.Image.RGBImage import RGBImage  # Import the known working version
+from pytti.LossAug import HSVLoss
+from pytti.ImageGuide import DirectImageGuide
 import torch
-from torch import nn
+from torch import nn, optim
 from torch.nn import functional as F
 from torchvision.transforms import functional as TF
 from PIL import Image
@@ -53,145 +55,242 @@ class CAModel(nn.Module):
         
         return new_state.clamp(0, 1)
 
+# Compile frequently called function with TorchScript for speed
+@torch.jit.script
+def break_tensor(tensor):
+    floors = tensor.floor().long()
+    ceils = tensor.ceil().long()
+    rounds = tensor.round().long()
+    fracs = tensor - floors
+    return floors, ceils, rounds, fracs
+
 class GNCAImage(DifferentiableImage):
     """
-    Simplified GNCA image with stable growth and no color bias
+    GNCA-based image with palette support for color stability
     """
     
-    @vram_usage_mode('GNCA Image')
-    def __init__(self, width, height, scale=1, **kwargs):
-        super().__init__(width, height)
+    @vram_usage_mode('GNCA Palette Image')
+    def __init__(self, width, height, scale=1, pallet_size=8, n_pallets=8, 
+                 gamma=1, hdr_weight=0.5, norm_weight=0.1, device=DEVICE):
+        super().__init__(width * scale, height * scale)
+        
+        # Palette parameters
+        self.pallet_inertia = 2
+        pallet = torch.linspace(0, self.pallet_inertia, pallet_size).pow(gamma).view(pallet_size, 1, 1).repeat(1, n_pallets, 3)
+        self.pallet = nn.Parameter(pallet.to(device, dtype=torch.float32))
+        self.pallet_size = pallet_size
+        self.n_pallets = n_pallets
+        
+        # Value and tensor parameters (like PixelImage)
+        self.value = nn.Parameter(torch.zeros(height, width, dtype=torch.float32, device=device))
+        self.tensor = nn.Parameter(torch.zeros(n_pallets, height, width, dtype=torch.float32, device=device))
+        
+        # GNCA parameters
         self.scale = scale
-        
-        # Create tensor in RGB format
-        self.tensor = nn.Parameter(torch.zeros(3, height, width, device=DEVICE))
-        
-        # Match the expected output axes format
-        self.output_axes = ('s', 'y', 'x')
-        
-        # Animation parameters
         self.steps_per_update = 1
-        self.update_mode = 'grow'  # 'grow', 'none'
+        self.update_mode = 'grow'  # 'grow' or 'none'
         
         # Register buffers for CA state
-        self.register_buffer('alive_mask', torch.zeros(1, height, width, device=DEVICE))
+        self.register_buffer('alive_mask', torch.zeros(1, height, width, device=device))
         self.register_buffer('grad_buffer', torch.zeros_like(self.tensor))
+        self.register_buffer('pallet_target', torch.empty_like(self.pallet))
+        self.use_pallet_target = False
         
-        # Initialize with visible pattern
+        # Output format
+        self.output_axes = ('n', 's', 'y', 'x')
+        self.latent_strength = 0.1
+        
+        # Loss functions like PixelImage
+        self.hdr_loss = HdrLoss(pallet_size, n_pallets, gamma, hdr_weight) if hdr_weight != 0 else None
+        self.loss = PalletLoss(n_pallets, norm_weight)
+        
+        # Initialize with a pattern
         self.reset_state()
-    
-    def reset_state(self):
-        """Reset image state with colorful pattern"""
-        with torch.no_grad():
-            # Clear tensor and buffers
-            self.tensor.zero_()
-            self.alive_mask.zero_()
-            self.grad_buffer.zero_()
-            
-            # Get dimensions
-            c, h, w = self.tensor.shape
-            
-            # Create coordinate grid
-            y = torch.linspace(-1, 1, h).view(-1, 1).expand(-1, w)
-            x = torch.linspace(-1, 1, w).view(1, -1).expand(h, -1)
-            
-            # Create distance from center
-            dist = torch.sqrt(x.pow(2) + y.pow(2)).clamp(0, 1)
-            
-            # Create pattern with balanced colors
-            r = 0.5 + 0.5 * torch.sin(dist * 6.0)
-            g = 0.5 + 0.5 * torch.sin(dist * 7.0 + 2.1)
-            b = 0.5 + 0.5 * torch.sin(dist * 8.0 + 4.2)
-            
-            # Set tensor values
-            self.tensor[0] = r
-            self.tensor[1] = g
-            self.tensor[2] = b
-            
-            # Initialize alive mask in the center
-            center_size = min(h, w) // 8
-            cy, cx = h//2, w//2
-            self.alive_mask[0, cy-center_size:cy+center_size, cx-center_size:cx+center_size] = 1.0
     
     def clone(self):
         """Create a clone of this image"""
         width, height = self.image_shape
-        clone = GNCAImage(width, height, self.scale)
+        dummy = GNCAImage(width // self.scale, height // self.scale, self.scale, self.pallet_size, self.n_pallets,
+                          hdr_weight=0 if self.hdr_loss is None else float(self.hdr_loss.weight),
+                          norm_weight=float(self.loss.weight))
         with torch.no_grad():
-            clone.tensor.copy_(self.tensor)
-            clone.alive_mask.copy_(self.alive_mask)
-            clone.grad_buffer.copy_(self.grad_buffer)
-            clone.steps_per_update = self.steps_per_update
-            clone.update_mode = self.update_mode
-        return clone
+            dummy.value.copy_(self.value)
+            dummy.tensor.copy_(self.tensor)
+            dummy.pallet.copy_(self.pallet)
+            dummy.alive_mask.copy_(self.alive_mask)
+            dummy.grad_buffer.copy_(self.grad_buffer)
+            dummy.pallet_target.copy_(self.pallet_target)
+            dummy.use_pallet_target = self.use_pallet_target
+            dummy.steps_per_update = self.steps_per_update
+            dummy.update_mode = self.update_mode
+        return dummy
     
-    def decode_tensor(self):
-        """Returns tensor in the expected output format"""
-        return self.tensor
-    
-    def get_image_tensor(self):
-        """Return tensor for transformations"""
-        return self.tensor
-    
-    def set_image_tensor(self, tensor):
-        """Set from tensor"""
+    def reset_state(self):
+        """Initialize with a basic pattern"""
         with torch.no_grad():
-            self.tensor.copy_(tensor)
-    
-    def encode_image(self, pil_image, smart_encode=True, device=DEVICE):
-        """Set from target image"""
-        # Convert PIL image to tensor
-        img_tensor = TF.to_tensor(pil_image).to(device)
-        
-        # Resize if needed
-        c, h, w = self.tensor.shape
-        if img_tensor.shape[1] != h or img_tensor.shape[2] != w:
-            img_tensor = F.interpolate(
-                img_tensor.unsqueeze(0),
-                size=(h, w),
-                mode='bilinear',
-                align_corners=False
-            ).squeeze(0)
-        
-        # Set tensor
-        with torch.no_grad():
-            self.tensor.copy_(img_tensor)
-            self.grad_buffer.zero_()
+            # Initialize palette with smooth gradient
+            for i in range(self.n_pallets):
+                self.pallet[:, i, 0] = torch.linspace(0.2, 0.8, self.pallet_size)  # Red
+                self.pallet[:, i, 1] = torch.linspace(0.8, 0.2, self.pallet_size)  # Green
+                self.pallet[:, i, 2] = torch.sin(torch.linspace(0, 3.14, self.pallet_size)) * 0.5 + 0.5  # Blue
             
-            # Initialize alive mask based on image content
-            luminance = 0.299 * img_tensor[0] + 0.587 * img_tensor[1] + 0.114 * img_tensor[2]
-            edges = torch.abs(luminance[1:, :] - luminance[:-1, :]).mean() * 3
-            self.alive_mask = (luminance > luminance.mean()).float().unsqueeze(0)
+            # Create a simple pattern
+            h, w = self.value.shape
+            y = torch.linspace(0, 1, h).view(-1, 1).expand(-1, w)
+            x = torch.linspace(0, 1, w).view(1, -1).expand(h, -1)
             
-            # Ensure some minimum alive area
-            if self.alive_mask.mean() < 0.2:
-                # If too little is alive, set at least the center
-                center_size = min(h, w) // 4
-                cy, cx = h//2, w//2
-                self.alive_mask[0, cy-center_size:cy+center_size, cx-center_size:cx+center_size] = 1.0
-    
-    def encode_random(self):
-        """Fill with random data"""
-        with torch.no_grad():
-            for i in range(3):
-                # Generate perlin-like noise for natural look
-                noise = torch.randn(self.tensor.shape[1]//8, self.tensor.shape[2]//8, device=self.tensor.device)
-                noise = F.interpolate(
-                    noise.unsqueeze(0).unsqueeze(0), 
-                    size=self.tensor.shape[1:], 
-                    mode='bicubic'
-                ).squeeze(0)
-                self.tensor[i] = (noise * 0.3 + 0.5).clamp(0, 1)
+            # Initialize value with distance pattern
+            dist = torch.sqrt((x - 0.5)**2 + (y - 0.5)**2).clamp(0, 1)
+            self.value.copy_(dist)
             
-            # Reset grad buffer
-            self.grad_buffer.zero_()
-            
-            # Set alive mask to center region
-            h, w = self.tensor.shape[1:]
+            # Initialize palette weights for center region
+            self.tensor.zero_()
             center_size = min(h, w) // 4
             cy, cx = h//2, w//2
+            
+            # Assign different palette indices to different regions
+            for i in range(min(4, self.n_pallets)):
+                quadrant_y, quadrant_x = i // 2, i % 2
+                y_start = cy - center_size + quadrant_y * center_size
+                y_end = cy - center_size + (quadrant_y + 1) * center_size
+                x_start = cx - center_size + quadrant_x * center_size
+                x_end = cx - center_size + (quadrant_x + 1) * center_size
+                
+                y_start, y_end = max(0, y_start), min(h, y_end)
+                x_start, x_end = max(0, x_start), min(w, x_end)
+                
+                if y_end > y_start and x_end > x_start:
+                    self.tensor[i, y_start:y_end, x_start:x_end] = 1.0
+            
+            # Initialize alive mask in center
             self.alive_mask.zero_()
             self.alive_mask[0, cy-center_size:cy+center_size, cx-center_size:cx+center_size] = 1.0
+            
+            # Clear grad buffer
+            self.grad_buffer.zero_()
+    
+    def set_pallet_target(self, pil_image):
+        """Set target palette from image (like PixelImage)"""
+        if pil_image is None:
+            self.use_pallet_target = False
+            return
+        dummy = self.clone()
+        dummy.use_pallet_target = False
+        dummy.encode_image(pil_image)
+        with torch.no_grad():
+            self.pallet_target.copy_(dummy.sort_pallet())
+            self.pallet.copy_(self.pallet_target)
+            self.use_pallet_target = True
+    
+    @torch.no_grad()
+    def lock_pallet(self, lock=True):
+        """Lock the palette (like PixelImage)"""
+        if lock:
+            self.pallet_target.copy_(self.sort_pallet())
+        self.use_pallet_target = lock
+    
+    def image_loss(self):
+        """Return image-specific losses (like PixelImage)"""
+        return [x for x in [self.hdr_loss, self.loss] if x is not None]
+    
+    def sort_pallet(self):
+        """Sort the palette by brightness (like PixelImage)"""
+        if self.use_pallet_target:
+            return self.pallet_target
+        pallet = (self.pallet / self.pallet_inertia).clamp(0, 1)
+        # Calculate color norms for sorting
+        magic_color = pallet.new_tensor([[[0.299, 0.587, 0.114]]])
+        color_norms = pallet.square().mul(magic_color).sum(dim=-1)
+        # Optimized sorting using torch.gather
+        pallet_indices = color_norms.argsort(dim=0)
+        sorted_pallet = torch.gather(pallet, 0, pallet_indices.unsqueeze(-1).expand(-1, self.n_pallets, 3))
+        return sorted_pallet
+    
+    def get_image_tensor(self):
+        """Return tensor for transformations (like PixelImage)"""
+        return torch.cat([self.value.unsqueeze(0), self.tensor])
+    
+    @torch.no_grad()
+    def set_image_tensor(self, tensor):
+        """Set tensor from external source (like PixelImage)"""
+        self.value.copy_(tensor[0])
+        self.tensor.copy_(tensor[1:])
+    
+    def decode_tensor(self):
+        """Convert to RGB tensor (like PixelImage, but simplified)"""
+        width, height = self.image_shape
+        pallet = self.sort_pallet()
+        
+        # Brightness values of pixels
+        values = self.value.clamp(0, 1) * (self.pallet_size - 1)
+        value_floors, value_ceils, value_rounds, value_fracs = break_tensor(values)
+        value_fracs = value_fracs.unsqueeze(-1).unsqueeze(-1)
+        
+        # Get palette weights using softmax for smooth blending
+        pallet_weights = self.tensor.movedim(0, 2)
+        pallet_weights = F.softmax(pallet_weights, dim=2).unsqueeze(-1)
+        
+        # Get colors based on brightness values
+        colors_cont = pallet[value_floors] * (1 - value_fracs) + pallet[value_ceils] * value_fracs
+        colors_cont = (colors_cont * pallet_weights).sum(dim=2)
+        
+        # Resize to final dimensions
+        colors_cont = F.interpolate(
+            colors_cont.permute(2, 0, 1).unsqueeze(0),
+            size=(height, width),
+            mode='nearest'
+        ).squeeze(0)
+        
+        return colors_cont
+    
+    def encode_image(self, pil_image, smart_encode=True, device=DEVICE):
+        """Encode from PIL image with palette (like PixelImage)"""
+        width, height = self.image_shape
+        
+        # Resize and convert to tensor
+        scale = self.scale
+        color_ref = pil_image.resize((width // scale, height // scale), Image.LANCZOS)
+        color_ref = TF.to_tensor(color_ref).to(device)
+        
+        # Calculate grayscale values for brightness
+        with torch.no_grad():
+            magic_color = torch.tensor([0.299, 0.587, 0.114], device=device).view(3, 1, 1)
+            value_ref = (color_ref * magic_color).sum(dim=0)
+            self.value.copy_(value_ref)
+            
+            # Initialize alive mask based on brightness
+            self.alive_mask[0] = (value_ref > value_ref.mean() * 0.8).float()
+        
+        if smart_encode:
+            # Use HSV loss to better match the colors
+            mse = HSVLoss.TargetImage('HSV loss', self.image_shape, pil_image)
+            
+            # Temporarily disable HDR loss for faster encoding
+            if self.hdr_loss is not None:
+                before_weight = self.hdr_loss.weight.clone()
+                self.hdr_loss.set_weight(0.01)
+                
+            # Optimize palette and weights to match the image
+            guide = DirectImageGuide(self, None, optimizer=optim.Adam([self.pallet, self.tensor], lr=0.1))
+            guide.run_steps(100, [], [], [mse])
+            
+            if self.hdr_loss is not None:
+                self.hdr_loss.set_weight(before_weight)
+    
+    def encode_random(self, random_pallet=False):
+        """Initialize with random values (like PixelImage)"""
+        with torch.no_grad():
+            self.value.uniform_()
+            self.tensor.uniform_()
+            if random_pallet:
+                self.pallet.uniform_(to=self.pallet_inertia)
+            
+            # Initialize alive mask with random connected regions
+            h, w = self.value.shape
+            noise = torch.randn(h//4, w//4, device=self.value.device)
+            noise = F.interpolate(noise.unsqueeze(0).unsqueeze(0), size=(h, w), mode='bicubic').squeeze(0)
+            self.alive_mask[0] = (noise > noise.mean()).float()
+            self.alive_mask = F.max_pool2d(self.alive_mask, 5, stride=1, padding=2)
     
     def set_steps_per_update(self, steps):
         """Set animation speed"""
@@ -204,184 +303,94 @@ class GNCAImage(DifferentiableImage):
     
     @torch.no_grad()
     def update(self):
-        """Simple CA growth with stable color balance"""
+        """Update the image with CA growth"""
+        # First update palette parameters like PixelImage
+        self.pallet.copy_(self.pallet.clamp(0, self.pallet_inertia))
+        self.value.copy_(self.value.clamp(0, 1))
+        self.tensor.copy_(self.tensor.clamp(0, float('inf')))
+        
         if self.update_mode == 'none':
             return
             
-        # Store gradients from CLIP in the buffer if available
+        # Store gradients if available
         if self.tensor.grad is not None:
             self.grad_buffer.copy_(self.tensor.grad)
             self.tensor.grad.zero_()
-        
+            
+        # Run CA growth steps
         for _ in range(self.steps_per_update):
             if self.update_mode == 'grow':
-                # 1. SAVE THE PREVIOUS ALIVE MASK to ensure it doesn't decrease
+                # 1. Save current alive mask
                 prev_alive = self.alive_mask.clone()
                 
-                # 2. GROW THE MASK first (before updating colors)
-                # Calculate growth probability based on neighborhood
+                # 2. Calculate growth probability
                 neighbors = F.avg_pool2d(self.alive_mask, kernel_size=3, stride=1, padding=1)
-                growth_prob = neighbors * (1 - self.alive_mask)  # Higher probability where more neighbors
+                growth_prob = neighbors * (1 - self.alive_mask)
                 
-                # Randomly grow based on probability
+                # 3. Grow mask with randomness
                 rand_mask = torch.rand_like(growth_prob) < growth_prob * 0.3
                 new_alive = self.alive_mask + rand_mask.float() * 0.5
                 
-                # 3. NEVER DECREASE the alive mask (ensure stability)
+                # 4. Never decrease alive mask
                 self.alive_mask = torch.maximum(new_alive, prev_alive)
                 
-                # 4. UPDATE COLORS in alive regions
-                # Use gradients to guide the color updates
-                grad_influence = 0.1  # How much gradients affect the update
+                # 5. Update palette weights (tensor) in alive regions
+                # Get the current palette distribution
+                weights = F.softmax(self.tensor, dim=0)
                 
-                # Simple diffusion to spread colors
+                # Apply diffusion to weights
                 kernel = torch.ones(1, 1, 3, 3, device=self.tensor.device) / 9.0
+                diffused_weights = torch.zeros_like(weights)
                 
-                for c in range(3):
-                    channel = self.tensor[c:c+1].unsqueeze(0)
-                    # Diffuse colors
-                    blurred = F.conv2d(channel, kernel, padding=1)
-                    
-                    # Add CLIP gradient influence
-                    grad_channel = self.grad_buffer[c:c+1].unsqueeze(0)
-                    gradient_term = grad_channel * grad_influence
-                    
-                    # Add subtle random variation to avoid stagnation
-                    noise = torch.randn_like(blurred) * 0.02
-                    
-                    # Create new state from diffusion + gradients + noise
-                    new_state = blurred - gradient_term + noise
-                    
-                    # Only update in alive regions
-                    alive_expanded = self.alive_mask.expand_as(blurred)
-                    new_channel = channel * (1 - alive_expanded) + new_state * alive_expanded
-                    
-                    # Update channel with new values
-                    self.tensor[c:c+1] = new_channel.squeeze(0)
+                for i in range(self.n_pallets):
+                    channel = weights[i:i+1].unsqueeze(0)
+                    diffused = F.conv2d(channel, kernel, padding=1)
+                    diffused_weights[i] = diffused.squeeze(0)
                 
-                # Ensure color balance after update
-                avg_colors = self.tensor.mean(dim=(1, 2))
-                if avg_colors.std() > 0.05:  # If colors are getting unbalanced
-                    # Move color channels closer to their average
-                    avg = avg_colors.mean()
-                    self.tensor = self.tensor + (avg - avg_colors.view(3, 1, 1)) * 0.1
-                    
-                # Ensure values stay in valid range
-                self.tensor.clamp_(0, 1)
-    
-    # Required for compatibility
-    def image_loss(self):
-        return []
-    
-    def set_pallet_target(self, pil_image):
-        if pil_image is not None:
-            self.encode_image(pil_image)
-    
-    @torch.no_grad()
-    def lock_pallet(self, lock=True):
-        pass 
-    def _grow_alive_mask(self):
-        """Grow the alive mask more aggressively"""
-        # Get current alive pixels
-        current_alive = self.alive_mask > 0.5
-        
-        # Find edges of alive regions (where growth happens)
-        dilated = F.max_pool2d(self.alive_mask, kernel_size=5, stride=1, padding=2)
-        edge_mask = (dilated > 0.5) & ~current_alive
-        
-        # Add probability of growth at edges
-        growth_prob = torch.rand_like(self.alive_mask) < 0.3
-        new_alive = edge_mask & growth_prob
-        
-        # Update mask with new growth
-        self.alive_mask = torch.maximum(
-            self.alive_mask,
-            new_alive.float() * 0.7  # New areas start at 70% alive
-        )
-    
-    @torch.no_grad()
-    def update(self):
-        """Neural CA update with more visible effects"""
-        if self.update_mode == 'none':
-            return
-            
-        # Store gradients from CLIP in the buffer
-        if self.tensor.grad is not None:
-            self.grad_buffer.copy_(self.tensor.grad)
-            self.tensor.grad.zero_()
-        
-        # Ensure we have some gradient signal (use random if none)
-        if self.grad_buffer.abs().sum() < 1e-6:
-            self.grad_buffer.copy_(torch.randn_like(self.grad_buffer) * 0.01)
-        
-        for _ in range(self.steps_per_update):
-            if self.update_mode == 'neural':
-                # Run the neural CA model with current strength
-                next_state = self.ca_model(
-                    self.tensor.unsqueeze(0),
-                    self.grad_buffer.unsqueeze(0),
-                    float(self.update_strength)
-                )
+                # Convert back to logits for the tensor
+                diffused_tensor = torch.log(diffused_weights.clamp(min=1e-6))
                 
-                # Apply updated state only in alive areas
-                alive_mask_expanded = self.alive_mask.expand_as(self.tensor)
+                # Only update in alive regions
+                alive_expanded = self.alive_mask.expand_as(self.tensor)
                 self.tensor.copy_(
-                    self.tensor * (1 - alive_mask_expanded) + 
-                    next_state.squeeze(0) * alive_mask_expanded
+                    self.tensor * (1 - alive_expanded) + 
+                    diffused_tensor * alive_expanded
                 )
                 
-                # Grow the alive mask for more visible spreading
-                self._grow_alive_mask()
+                # 6. Update brightness values with smoother gradients
+                value_kernel = torch.ones(3, 3, device=self.value.device) / 9.0
+                diffused_value = F.conv2d(
+                    self.value.unsqueeze(0).unsqueeze(0), 
+                    value_kernel.unsqueeze(0).unsqueeze(0), 
+                    padding=1
+                ).squeeze(0).squeeze(0)
                 
-                # Train the CA model to maintain coherence (occasionally)
-                if torch.rand(1).item() < 0.1:
-                    self._train_ca_step()
-    
-    def _train_ca_step(self):
-        """Train CA model to create more interesting patterns"""
-        with torch.enable_grad():
-            # Sample input state
-            x = self.tensor.unsqueeze(0).detach().clone().requires_grad_(True)
-            
-            # Run model
-            next_state = self.ca_model(x, self.grad_buffer.unsqueeze(0), float(self.update_strength))
-            
-            # Calculate change
-            diff = next_state - x
-            
-            # Create target that follows CLIP gradients but maintains structure
-            target_diff = self.grad_buffer.unsqueeze(0) * 0.1
-            
-            # Loss to follow CLIP guidance
-            direction_loss = F.mse_loss(diff, target_diff)
-            
-            # Loss to create visually interesting patterns
-            pattern_loss = 0.1 * (
-                # Encourage some local contrast (but not too much)
-                - F.mse_loss(next_state[:, :, 1:, :], next_state[:, :, :-1, :]) * 0.5 +
-                # But discourage harsh transitions
-                F.smooth_l1_loss(next_state[:, :, 1:, :], next_state[:, :, :-1, :]) * 2.0
-            )
-            
-            # Loss to prevent color extremes
-            color_balance_loss = 0.2 * torch.abs(next_state.mean(dim=(2, 3)) - 0.5).mean()
-            
-            # Combined loss
-            loss = direction_loss + pattern_loss + color_balance_loss
-            
-            # Update model
-            self.ca_optimizer.zero_grad()
-            loss.backward()
-            self.ca_optimizer.step()
-    
-    # Required for compatibility
-    def image_loss(self):
-        return []
-    
-    def set_pallet_target(self, pil_image):
-        if pil_image is not None:
-            self.encode_image(pil_image)
+                # Apply to alive regions
+                alive_mask_2d = self.alive_mask.squeeze(0)
+                self.value.copy_(
+                    self.value * (1 - alive_mask_2d) + 
+                    diffused_value * alive_mask_2d
+                )
     
     @torch.no_grad()
-    def lock_pallet(self, lock=True):
-        pass 
+    def render_value_image(self):
+        """Render value image for visualization (like PixelImage)"""
+        width, height = self.image_shape
+        values = self.value.clamp(0, 1).unsqueeze(-1).repeat(1, 1, 3)
+        array = (values.mul(255).clamp(0, 255).cpu().numpy().astype(np.uint8))
+        return Image.fromarray(array).resize((width, height), Image.NEAREST)
+    
+    @torch.no_grad()
+    def render_pallet(self):
+        """Render palette for visualization (like PixelImage)"""
+        pallet = self.sort_pallet()
+        width, height = self.n_pallets * 16, self.pallet_size * 32
+        array = (pallet.mul(255).clamp(0, 255).cpu().numpy().astype(np.uint8))
+        return Image.fromarray(array).resize((width, height), Image.NEAREST)
+    
+    @torch.no_grad()
+    def decode_image(self):
+        """Convert to PIL image for display"""
+        tensor = self.decode_tensor()
+        array = (tensor.permute(1, 2, 0).mul(255).clamp(0, 255).cpu().numpy().astype(np.uint8))
+        return Image.fromarray(array)
