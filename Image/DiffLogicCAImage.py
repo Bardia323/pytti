@@ -352,18 +352,17 @@ class DiffLogicCAImage(DifferentiableImage):
         self.state[..., :self.rgb_channels] = rgb
     
     def step(self, hard=False):
-        """Simplified step method for better performance"""
+        """Simplified step method with better balance between CA rules and CLIP guidance"""
         height, width, channels = self.state.shape
         
-        # Use a simple cellular automaton rule for testing
-        # This is much faster than the full perception/update circuit
+        # Use a simplified CA rule that preserves more of the image structure
         with torch.no_grad():
             # Create a padded version of the state
             padded = F.pad(self.state.permute(2, 0, 1), [1, 1, 1, 1], mode='replicate')
             
-            # Simple convolution to count neighbors (for Game of Life-like rules)
+            # Simple convolution to process neighborhoods
             kernel = torch.ones(1, 1, 3, 3, device=self.device)
-            kernel[0, 0, 1, 1] = 0  # Don't count the center cell
+            kernel[0, 0, 1, 1] = 0.5  # Give more weight to the center cell
             
             new_state = torch.zeros_like(self.state)
             
@@ -372,22 +371,24 @@ class DiffLogicCAImage(DifferentiableImage):
                 # Get this channel
                 channel = padded[c:c+1].unsqueeze(0)
                 
-                # Count neighbors
+                # Apply gentle neighborhood influence
                 neighbors = F.conv2d(channel, kernel, padding=0)[0, 0]
                 
                 # Current state
                 current = self.state[..., c]
                 
-                # Apply Game of Life-like rules
-                # Live cells with 2-3 neighbors survive
-                # Dead cells with 3 neighbors become alive
+                # Apply modified rule that preserves more of the current state
                 if hard:
-                    new_state[..., c] = ((current > 0.5) & ((neighbors >= 2) & (neighbors <= 3))) | ((current <= 0.5) & (neighbors == 3))
+                    # For hard updates, use a more stable rule
+                    # Keep center cell with 70% probability, neighbors with 30%
+                    mask = torch.rand_like(current) > 0.3
+                    influence = neighbors * 0.3  # 30% influence from neighbors
+                    new_state[..., c] = torch.where(mask, current, (current * 0.7 + influence))
                 else:
-                    # Continuous version
-                    survive = (current > 0.5) * ((neighbors >= 2) & (neighbors <= 3)).float()
-                    born = (current <= 0.5) * (neighbors == 3).float()
-                    new_state[..., c] = survive + born
+                    # For soft updates, blend current state with neighborhood
+                    # This preserves more of the current state (70%) while taking
+                    # some influence from neighbors (30%)
+                    new_state[..., c] = current * 0.7 + neighbors * 0.3
         
         self.state = nn.Parameter(new_state)
     
@@ -413,43 +414,104 @@ class DiffLogicCAImage(DifferentiableImage):
         self.step(hard=True)
     
     def encode_image(self, pil_image, smart_encode=True, device=DEVICE):
-        """Convert a PIL image to CA state"""
+        """Enhanced encode_image with better preservation of input image"""
         # Resize the image
         pil_image = pil_image.resize((self.width, self.height), Image.LANCZOS)
         
         # Convert to tensor and normalize to [0,1]
         img_tensor = TF.to_tensor(pil_image).to(device)
         
-        # Initialize first rgb_channels with the image values (binarized)
-        # If smart_encode is True, we can use a more sophisticated encoding
         if smart_encode:
-            # You can implement a more sophisticated encoding here if needed
-            # For now, just use the same binarization
-            rgb = (img_tensor > 0.5).float()
+            # Use a more flexible encoding that preserves more image detail
+            # Instead of just binary thresholding, use multiple levels
+            # Create levels for better detail preservation
+            levels = 5
+            rgb = torch.zeros_like(img_tensor)
+            
+            # Create multi-level quantization
+            for level in range(levels):
+                threshold = level / (levels - 1)
+                rgb += (img_tensor > threshold).float() / levels
         else:
+            # Simple binary encoding
             rgb = (img_tensor > 0.5).float()
         
         # Initialize state
         state = torch.zeros(self.height, self.width, self.ca_channels, device=device)
         state[..., :self.rgb_channels] = rgb.permute(1, 2, 0)
         
-        # Initialize a seed in the center
+        # Initialize hidden channels with some random noise for variety
+        if self.ca_channels > self.rgb_channels:
+            # Small amount of noise in hidden channels
+            noise = torch.rand(self.height, self.width, self.ca_channels - self.rgb_channels, device=device) * 0.1
+            state[..., self.rgb_channels:] = noise
+        
+        # Create gradient in center for better pattern formation
         center_h, center_w = self.height // 2, self.width // 2
-        state[center_h, center_w, :] = 1.0
+        radius = min(self.height, self.width) // 4
+        
+        # Add radial gradient from center
+        y_coords = torch.arange(self.height, device=device).view(-1, 1).repeat(1, self.width)
+        x_coords = torch.arange(self.width, device=device).view(1, -1).repeat(self.height, 1)
+        dist = torch.sqrt((y_coords - center_h)**2 + (x_coords - center_w)**2)
+        
+        # Create radial gradient mask
+        mask = torch.exp(-(dist**2) / (2 * radius**2))
+        
+        # Apply mask to all channels to create a central focus
+        for c in range(self.ca_channels):
+            state[..., c] = state[..., c] * (1.0 - mask * 0.3)
         
         self.state = nn.Parameter(state)
     
     @torch.no_grad()
     def encode_random(self):
-        """Initialize with random state"""
-        # Random binary state
-        state = torch.randint(0, 2, (self.height, self.width, self.ca_channels), 
-                              device=self.device).float()
-        
-        # Or just a center seed
+        """Initialize with a more structured random state for better pattern formation"""
+        # Create a more interesting starting state with some structure
         state = torch.zeros(self.height, self.width, self.ca_channels, device=self.device)
+        
+        # Random seed points scattered throughout the image
+        num_seeds = max(5, min(20, self.width * self.height // 1000))
+        for _ in range(num_seeds):
+            # Random position
+            x = np.random.randint(0, self.width)
+            y = np.random.randint(0, self.height)
+            # Random seed value
+            state[y, x, :] = torch.rand(self.ca_channels, device=self.device)
+        
+        # Add a center seed with higher intensity
         center_h, center_w = self.height // 2, self.width // 2
-        state[center_h, center_w, :] = 1.0
+        radius = min(self.height, self.width) // 4
+        
+        # Create radial gradient from center
+        y_coords = torch.arange(self.height, device=self.device).view(-1, 1).repeat(1, self.width)
+        x_coords = torch.arange(self.width, device=self.device).view(1, -1).repeat(self.height, 1)
+        dist = torch.sqrt((y_coords - center_h)**2 + (x_coords - center_w)**2)
+        
+        # Create radial gradient
+        gradient = torch.exp(-(dist**2) / (2 * radius**2))
+        
+        # RGB channels get color gradient from center
+        for c in range(min(3, self.rgb_channels)):
+            # Create a colorful center with different values per channel
+            color_value = 0.5 + 0.5 * torch.sin(torch.tensor([c * np.pi * 2 / 3]))
+            state[..., c] += gradient * color_value
+        
+        # Hidden channels get some structure too
+        if self.ca_channels > self.rgb_channels:
+            # Create patterns in hidden channels - wavelike patterns
+            for c in range(self.rgb_channels, self.ca_channels):
+                freq = 5.0 * (1 + (c - self.rgb_channels) % 3)
+                phase = c * np.pi / 4
+                pattern = 0.5 + 0.5 * torch.sin(freq * dist + phase)
+                state[..., c] += pattern * 0.2  # Subtle influence
+        
+        # Add some noise everywhere for variety
+        noise = torch.rand_like(state) * 0.1
+        state = state + noise
+        
+        # Clamp values to valid range
+        state = state.clamp(0, 1)
         
         self.state = nn.Parameter(state)
     
@@ -532,7 +594,7 @@ class DiffLogicCAImage(DifferentiableImage):
 
     def train(self, i, prompts, interp_prompts, loss_augs, interp_steps=0):
         """
-        Integration with Pytti's training loop.
+        Integration with Pytti's training loop with improved CLIP guidance.
         This method is called by the DirectImageGuide to update the image based on prompts.
         """
         # Get the current image tensor
@@ -574,15 +636,22 @@ class DiffLogicCAImage(DifferentiableImage):
                     # Focus on RGB channels (first 3)
                     rgb_grad = grad[..., :self.rgb_channels]
                     
-                    # Apply gradient influence (small step)
-                    influence = 0.01
+                    # Apply stronger gradient influence
+                    influence = 0.1  # Increased from 0.01 to 0.1
                     self.state.data[..., :self.rgb_channels] -= influence * rgb_grad
+                    
+                    # Also propagate some influence to other channels
+                    if self.ca_channels > self.rgb_channels:
+                        # Apply smaller influence to non-RGB channels
+                        hidden_grad = grad[..., self.rgb_channels:]
+                        self.state.data[..., self.rgb_channels:] -= influence * 0.3 * hidden_grad
                     
                     # Zero gradients for next step
                     self.state.grad.zero_()
         
         # Run a CA step after applying gradient influence
-        self.step(hard=False)  # Use soft logic during training
+        # Use soft logic during training for better gradient flow
+        self.step(hard=False)
         
         return losses
 
