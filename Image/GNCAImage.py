@@ -73,8 +73,9 @@ class GNCAImage(DifferentiableImage):
         self.steps_per_update = 1
         self.update_mode = 'grow'  # 'grow', 'none'
         
-        # Register buffer for CA state
+        # Register buffers for CA state
         self.register_buffer('alive_mask', torch.zeros(1, height, width, device=DEVICE))
+        self.register_buffer('grad_buffer', torch.zeros_like(self.tensor))
         
         # Initialize with visible pattern
         self.reset_state()
@@ -82,9 +83,10 @@ class GNCAImage(DifferentiableImage):
     def reset_state(self):
         """Reset image state with colorful pattern"""
         with torch.no_grad():
-            # Clear tensor and alive mask
+            # Clear tensor and buffers
             self.tensor.zero_()
             self.alive_mask.zero_()
+            self.grad_buffer.zero_()
             
             # Get dimensions
             c, h, w = self.tensor.shape
@@ -118,6 +120,7 @@ class GNCAImage(DifferentiableImage):
         with torch.no_grad():
             clone.tensor.copy_(self.tensor)
             clone.alive_mask.copy_(self.alive_mask)
+            clone.grad_buffer.copy_(self.grad_buffer)
             clone.steps_per_update = self.steps_per_update
             clone.update_mode = self.update_mode
         return clone
@@ -153,6 +156,7 @@ class GNCAImage(DifferentiableImage):
         # Set tensor
         with torch.no_grad():
             self.tensor.copy_(img_tensor)
+            self.grad_buffer.zero_()
             
             # Initialize alive mask based on image content
             luminance = 0.299 * img_tensor[0] + 0.587 * img_tensor[1] + 0.114 * img_tensor[2]
@@ -179,6 +183,9 @@ class GNCAImage(DifferentiableImage):
                 ).squeeze(0)
                 self.tensor[i] = (noise * 0.3 + 0.5).clamp(0, 1)
             
+            # Reset grad buffer
+            self.grad_buffer.zero_()
+            
             # Set alive mask to center region
             h, w = self.tensor.shape[1:]
             center_size = min(h, w) // 4
@@ -201,6 +208,11 @@ class GNCAImage(DifferentiableImage):
         if self.update_mode == 'none':
             return
             
+        # Store gradients from CLIP in the buffer if available
+        if self.tensor.grad is not None:
+            self.grad_buffer.copy_(self.tensor.grad)
+            self.tensor.grad.zero_()
+        
         for _ in range(self.steps_per_update):
             if self.update_mode == 'grow':
                 # 1. SAVE THE PREVIOUS ALIVE MASK to ensure it doesn't decrease
@@ -219,6 +231,9 @@ class GNCAImage(DifferentiableImage):
                 self.alive_mask = torch.maximum(new_alive, prev_alive)
                 
                 # 4. UPDATE COLORS in alive regions
+                # Use gradients to guide the color updates
+                grad_influence = 0.1  # How much gradients affect the update
+                
                 # Simple diffusion to spread colors
                 kernel = torch.ones(1, 1, 3, 3, device=self.tensor.device) / 9.0
                 
@@ -227,12 +242,19 @@ class GNCAImage(DifferentiableImage):
                     # Diffuse colors
                     blurred = F.conv2d(channel, kernel, padding=1)
                     
+                    # Add CLIP gradient influence
+                    grad_channel = self.grad_buffer[c:c+1].unsqueeze(0)
+                    gradient_term = grad_channel * grad_influence
+                    
                     # Add subtle random variation to avoid stagnation
                     noise = torch.randn_like(blurred) * 0.02
                     
-                    # Create the new state - only update in alive regions
+                    # Create new state from diffusion + gradients + noise
+                    new_state = blurred - gradient_term + noise
+                    
+                    # Only update in alive regions
                     alive_expanded = self.alive_mask.expand_as(blurred)
-                    new_channel = channel * (1 - alive_expanded) + (blurred + noise) * alive_expanded
+                    new_channel = channel * (1 - alive_expanded) + new_state * alive_expanded
                     
                     # Update channel with new values
                     self.tensor[c:c+1] = new_channel.squeeze(0)
