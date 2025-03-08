@@ -27,16 +27,22 @@ class GNCAImage(RGBImage):
     def init_pattern(self):
         """Initialize with a pretty pattern"""
         with torch.no_grad():
-            h, w = self.image_shape
+            # Get actual tensor dimensions
+            _, _, h, w = self.tensor.shape
             
-            # Create coordinate grids
-            y = torch.linspace(0, 1, h).view(-1, 1).expand(-1, w).to(self.tensor.device)
-            x = torch.linspace(0, 1, w).view(1, -1).expand(h, -1).to(self.tensor.device)
+            # Create coordinate grids with correct dimensions
+            y = torch.linspace(0, 1, h).view(-1, 1).repeat(1, w).to(self.tensor.device)
+            x = torch.linspace(0, 1, w).view(1, -1).repeat(h, 1).to(self.tensor.device)
             
             # Create interesting patterns
             r = torch.sin(x * 6.28) * 0.5 + 0.5  # Red channel
             g = torch.sin(y * 6.28) * 0.5 + 0.5  # Green channel
             b = torch.sin((x + y) * 4.28) * 0.5 + 0.5  # Blue channel
+            
+            # Verify shapes are correct
+            assert r.shape == (h, w)
+            assert g.shape == (h, w)
+            assert b.shape == (h, w)
             
             # Assign to tensor (keeping NCHW format)
             self.tensor[0, 0] = r
@@ -50,9 +56,6 @@ class GNCAImage(RGBImage):
     @torch.no_grad()
     def update(self):
         """Add subtle animation"""
-        # Call the parent update first
-        super().update()
-        
         # Additional animation effects
         for _ in range(self.steps_per_update):
             # Apply a simple blur for movement
