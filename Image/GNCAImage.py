@@ -201,11 +201,15 @@ class GNCAImage(DifferentiableImage):
             # Initialize hidden state in alive areas
             if self.channel_n > 4 and smart_encode:
                 alive_mask = (brightness > 0.2).float()
+                # Get target device from state tensor
+                target_device = self.state.device
+                
                 for i in range(4, self.channel_n):
                     # Different frequencies for different channels
                     freq = i / 2.0
-                    y = torch.linspace(0, h-1, h).view(-1, 1).expand(-1, w) / h
-                    x = torch.linspace(0, w-1, w).view(1, -1).expand(h, -1) / w
+                    # Create tensors on the correct device
+                    y = torch.linspace(0, h-1, h, device=target_device).view(-1, 1).expand(-1, w) / h
+                    x = torch.linspace(0, w-1, w, device=target_device).view(1, -1).expand(h, -1) / w
                     pattern = torch.sin(x * freq * np.pi) * torch.sin(y * freq * np.pi) * 0.5
                     self.state[0, i].copy_(pattern * alive_mask)
     
