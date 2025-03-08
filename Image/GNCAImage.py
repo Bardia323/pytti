@@ -55,10 +55,10 @@ class CAModel(nn.Module):
 
 class GNCAImage(DifferentiableImage):
     """
-    GNCA image with visibly different neural CA effects
+    Simplified GNCA image with stable growth and no color bias
     """
     
-    @vram_usage_mode('Neural CA Image')
+    @vram_usage_mode('GNCA Image')
     def __init__(self, width, height, scale=1, **kwargs):
         super().__init__(width, height)
         self.scale = scale
@@ -66,34 +66,24 @@ class GNCAImage(DifferentiableImage):
         # Create tensor in RGB format
         self.tensor = nn.Parameter(torch.zeros(3, height, width, device=DEVICE))
         
-        # Create the neural CA model
-        self.ca_model = CAModel().to(DEVICE)
-        
         # Match the expected output axes format
         self.output_axes = ('s', 'y', 'x')
         
         # Animation parameters
         self.steps_per_update = 1
-        self.update_mode = 'neural'  # 'neural', 'none'
-        self.debug_mode = False
+        self.update_mode = 'grow'  # 'grow', 'none'
         
-        # Register buffers
-        self.register_buffer('grad_buffer', torch.zeros_like(self.tensor))
+        # Register buffer for CA state
         self.register_buffer('alive_mask', torch.zeros(1, height, width, device=DEVICE))
-        self.register_buffer('update_strength', torch.tensor(0.3, device=DEVICE))
-        
-        # Initialize CA params
-        self.ca_optimizer = torch.optim.Adam(self.ca_model.parameters(), lr=5e-4)
         
         # Initialize with visible pattern
         self.reset_state()
     
     def reset_state(self):
-        """Reset image state with more distinct pattern"""
+        """Reset image state with colorful pattern"""
         with torch.no_grad():
-            # Clear tensor and buffers
+            # Clear tensor and alive mask
             self.tensor.zero_()
-            self.grad_buffer.zero_()
             self.alive_mask.zero_()
             
             # Get dimensions
@@ -106,18 +96,18 @@ class GNCAImage(DifferentiableImage):
             # Create distance from center
             dist = torch.sqrt(x.pow(2) + y.pow(2)).clamp(0, 1)
             
-            # Create pattern with more colors
-            r = 0.5 + 0.4 * torch.sin(dist * 3.14159 * 3)
-            g = 0.5 + 0.4 * torch.sin(dist * 3.14159 * 4 + 1.0)
-            b = 0.5 + 0.4 * torch.sin(dist * 3.14159 * 5 + 2.0)
+            # Create pattern with balanced colors
+            r = 0.5 + 0.5 * torch.sin(dist * 6.0)
+            g = 0.5 + 0.5 * torch.sin(dist * 7.0 + 2.1)
+            b = 0.5 + 0.5 * torch.sin(dist * 8.0 + 4.2)
             
-            # Set tensor values - colorful patterns
+            # Set tensor values
             self.tensor[0] = r
             self.tensor[1] = g
             self.tensor[2] = b
             
-            # Initialize alive mask in the center with a larger area
-            center_size = min(h, w) // 4
+            # Initialize alive mask in the center
+            center_size = min(h, w) // 8
             cy, cx = h//2, w//2
             self.alive_mask[0, cy-center_size:cy+center_size, cx-center_size:cx+center_size] = 1.0
     
@@ -127,22 +117,13 @@ class GNCAImage(DifferentiableImage):
         clone = GNCAImage(width, height, self.scale)
         with torch.no_grad():
             clone.tensor.copy_(self.tensor)
-            clone.grad_buffer.copy_(self.grad_buffer)
             clone.alive_mask.copy_(self.alive_mask)
-            clone.ca_model.load_state_dict(self.ca_model.state_dict())
             clone.steps_per_update = self.steps_per_update
             clone.update_mode = self.update_mode
-            clone.debug_mode = self.debug_mode
-            clone.update_strength.copy_(self.update_strength)
         return clone
     
     def decode_tensor(self):
         """Returns tensor in the expected output format"""
-        if self.debug_mode:
-            # In debug mode, show the alive mask as a green overlay
-            debug_tensor = self.tensor.clone()
-            debug_tensor[1] = torch.max(debug_tensor[1], self.alive_mask.squeeze(0) * 0.7)
-            return debug_tensor
         return self.tensor
     
     def get_image_tensor(self):
@@ -173,19 +154,23 @@ class GNCAImage(DifferentiableImage):
         with torch.no_grad():
             self.tensor.copy_(img_tensor)
             
-            # Initialize alive mask based on image content - more active areas
-            brightness = img_tensor.mean(dim=0, keepdim=True)
-            self.alive_mask[0] = (brightness > brightness.mean() * 0.8).float()
+            # Initialize alive mask based on image content
+            luminance = 0.299 * img_tensor[0] + 0.587 * img_tensor[1] + 0.114 * img_tensor[2]
+            edges = torch.abs(luminance[1:, :] - luminance[:-1, :]).mean() * 3
+            self.alive_mask = (luminance > luminance.mean()).float().unsqueeze(0)
             
-            # Grow the initial mask to cover more area
-            self.alive_mask = F.max_pool2d(self.alive_mask, kernel_size=7, stride=1, padding=3)
+            # Ensure some minimum alive area
+            if self.alive_mask.mean() < 0.2:
+                # If too little is alive, set at least the center
+                center_size = min(h, w) // 4
+                cy, cx = h//2, w//2
+                self.alive_mask[0, cy-center_size:cy+center_size, cx-center_size:cx+center_size] = 1.0
     
     def encode_random(self):
-        """Fill with random data with more distinct patterns"""
+        """Fill with random data"""
         with torch.no_grad():
-            # Create pattern with visible structure
             for i in range(3):
-                # Low-frequency noise
+                # Generate perlin-like noise for natural look
                 noise = torch.randn(self.tensor.shape[1]//8, self.tensor.shape[2]//8, device=self.tensor.device)
                 noise = F.interpolate(
                     noise.unsqueeze(0).unsqueeze(0), 
@@ -194,13 +179,12 @@ class GNCAImage(DifferentiableImage):
                 ).squeeze(0)
                 self.tensor[i] = (noise * 0.3 + 0.5).clamp(0, 1)
             
-            # Create alive mask with larger connected regions
-            noise = torch.randn(self.tensor.shape[1]//4, self.tensor.shape[2]//4, device=self.tensor.device)
-            noise = F.interpolate(noise.unsqueeze(0).unsqueeze(0), size=self.tensor.shape[1:], mode='bicubic').squeeze(0)
-            self.alive_mask[0] = (noise > noise.mean() * 0.5).float()
-            
-            # Grow the mask for more coverage
-            self.alive_mask = F.max_pool2d(self.alive_mask, kernel_size=5, stride=1, padding=2)
+            # Set alive mask to center region
+            h, w = self.tensor.shape[1:]
+            center_size = min(h, w) // 4
+            cy, cx = h//2, w//2
+            self.alive_mask.zero_()
+            self.alive_mask[0, cy-center_size:cy+center_size, cx-center_size:cx+center_size] = 1.0
     
     def set_steps_per_update(self, steps):
         """Set animation speed"""
@@ -208,19 +192,72 @@ class GNCAImage(DifferentiableImage):
     
     def set_update_mode(self, mode):
         """Set animation style"""
-        if mode in ['neural', 'none']:
+        if mode in ['grow', 'none']:
             self.update_mode = mode
     
-    def set_debug_mode(self, debug):
-        """Toggle debug visualization"""
-        self.debug_mode = debug
+    @torch.no_grad()
+    def update(self):
+        """Simple CA growth with stable color balance"""
+        if self.update_mode == 'none':
+            return
+            
+        for _ in range(self.steps_per_update):
+            if self.update_mode == 'grow':
+                # 1. SAVE THE PREVIOUS ALIVE MASK to ensure it doesn't decrease
+                prev_alive = self.alive_mask.clone()
+                
+                # 2. GROW THE MASK first (before updating colors)
+                # Calculate growth probability based on neighborhood
+                neighbors = F.avg_pool2d(self.alive_mask, kernel_size=3, stride=1, padding=1)
+                growth_prob = neighbors * (1 - self.alive_mask)  # Higher probability where more neighbors
+                
+                # Randomly grow based on probability
+                rand_mask = torch.rand_like(growth_prob) < growth_prob * 0.3
+                new_alive = self.alive_mask + rand_mask.float() * 0.5
+                
+                # 3. NEVER DECREASE the alive mask (ensure stability)
+                self.alive_mask = torch.maximum(new_alive, prev_alive)
+                
+                # 4. UPDATE COLORS in alive regions
+                # Simple diffusion to spread colors
+                kernel = torch.ones(1, 1, 3, 3, device=self.tensor.device) / 9.0
+                
+                for c in range(3):
+                    channel = self.tensor[c:c+1].unsqueeze(0)
+                    # Diffuse colors
+                    blurred = F.conv2d(channel, kernel, padding=1)
+                    
+                    # Add subtle random variation to avoid stagnation
+                    noise = torch.randn_like(blurred) * 0.02
+                    
+                    # Create the new state - only update in alive regions
+                    alive_expanded = self.alive_mask.expand_as(blurred)
+                    new_channel = channel * (1 - alive_expanded) + (blurred + noise) * alive_expanded
+                    
+                    # Update channel with new values
+                    self.tensor[c:c+1] = new_channel.squeeze(0)
+                
+                # Ensure color balance after update
+                avg_colors = self.tensor.mean(dim=(1, 2))
+                if avg_colors.std() > 0.05:  # If colors are getting unbalanced
+                    # Move color channels closer to their average
+                    avg = avg_colors.mean()
+                    self.tensor = self.tensor + (avg - avg_colors.view(3, 1, 1)) * 0.1
+                    
+                # Ensure values stay in valid range
+                self.tensor.clamp_(0, 1)
     
-    def set_update_strength(self, strength):
-        """Set how strong the neural updates should be"""
-        with torch.no_grad():
-            self.update_strength.copy_(torch.tensor(strength, device=self.update_strength.device))
+    # Required for compatibility
+    def image_loss(self):
+        return []
+    
+    def set_pallet_target(self, pil_image):
+        if pil_image is not None:
+            self.encode_image(pil_image)
     
     @torch.no_grad()
+    def lock_pallet(self, lock=True):
+        pass 
     def _grow_alive_mask(self):
         """Grow the alive mask more aggressively"""
         # Get current alive pixels
