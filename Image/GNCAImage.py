@@ -8,269 +8,278 @@ from torchvision.transforms import functional as TF
 from PIL import Image
 import numpy as np
 
+class CAModel(nn.Module):
+    """Neural Cellular Automata model that's fully differentiable"""
+    
+    def __init__(self, channel_n=16, hidden_n=128, device=DEVICE):
+        super().__init__()
+        self.channel_n = channel_n
+        
+        # Perception kernels for edge detection (3×3×channel_n)
+        self.register_buffer('identity', torch.tensor([0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0], 
+                                                    dtype=torch.float32).reshape(1, 1, 3, 3))
+        self.register_buffer('sobel_x', torch.tensor([1.0, 2.0, 1.0, 0.0, 0.0, 0.0, -1.0, -2.0, -1.0], 
+                                              dtype=torch.float32).reshape(1, 1, 3, 3) / 8.0)
+        self.register_buffer('sobel_y', torch.tensor([1.0, 0.0, -1.0, 2.0, 0.0, -2.0, 1.0, 0.0, -1.0], 
+                                              dtype=torch.float32).reshape(1, 1, 3, 3) / 8.0)
+        
+        # Neural update network (fully differentiable)
+        self.update_net = nn.Sequential(
+            nn.Conv2d(channel_n * 3, hidden_n, 1),
+            nn.ReLU(),
+            nn.Conv2d(hidden_n, channel_n, 1)
+        )
+        
+        # Initialize last layer to zeros for stability
+        with torch.no_grad():
+            self.update_net[-1].weight.zero_()
+            self.update_net[-1].bias.zero_()
+    
+    def perceive(self, x):
+        """Apply perception kernels to state"""
+        batch, c, h, w = x.shape
+        
+        # Split into separate channels
+        identity_out = []
+        sobel_x_out = []
+        sobel_y_out = []
+        
+        # Apply convolutions to each channel
+        for i in range(c):
+            # Extract one channel
+            channel = x[:, i:i+1]
+            
+            # Apply the three perception kernels
+            identity_out.append(F.conv2d(channel, self.identity, padding=1))
+            sobel_x_out.append(F.conv2d(channel, self.sobel_x, padding=1))
+            sobel_y_out.append(F.conv2d(channel, self.sobel_y, padding=1))
+        
+        # Concatenate results for all channels
+        identity_out = torch.cat(identity_out, dim=1)
+        sobel_x_out = torch.cat(sobel_x_out, dim=1)
+        sobel_y_out = torch.cat(sobel_y_out, dim=1)
+        
+        # Stack all perception features
+        perception = torch.cat([identity_out, sobel_x_out, sobel_y_out], dim=1)
+        return perception
+    
+    def forward(self, x, step_size=0.1):
+        """Perform one CA update step"""
+        # Get perception features
+        perception = self.perceive(x)
+        
+        # Apply update network
+        update = self.update_net(perception) * step_size
+        
+        # Apply update (residual connection)
+        x = x + update
+        
+        # Get alive mask (alpha channel if available, otherwise use mean)
+        if x.shape[1] > 3:
+            alive_mask = torch.sigmoid(x[:, 3:4]) > 0.1
+        else:
+            # For RGB-only, use mean brightness
+            alive_mask = x.mean(dim=1, keepdim=True) > 0.1
+            
+        return x * alive_mask.float()
+
 class GNCAImage(DifferentiableImage):
     """
-    Improved GNCA image class with better animation modes
+    Growing Neural Cellular Automata image for Pytti
     """
     
     @vram_usage_mode('GNCA Image')
-    def __init__(self, width, height, scale=1, **kwargs):
+    def __init__(self, width, height, scale=1, channel_n=16, device=DEVICE):
         super().__init__(width, height)
         self.scale = scale
+        self.channel_n = channel_n
         
-        # Create tensor in RGB format
-        self.tensor = nn.Parameter(torch.zeros(3, height, width, device=DEVICE))
+        # Create tensor for RGB + hidden channels
+        # First 4 channels are RGBA, rest are hidden state
+        self.state = nn.Parameter(torch.zeros(1, channel_n, height, width, device=device))
         
-        # Original tensor for reference (used in better CA)
-        self.register_buffer('original', torch.zeros_like(self.tensor))
+        # Create the CA model
+        self.ca_model = CAModel(channel_n, hidden_n=128, device=device)
         
-        # CRITICAL: Match the exact axes format
+        # CRITICAL: Match expected axes format
         self.output_axes = ('s', 'y', 'x')
         
-        # Animation parameters
+        # Parameters
+        self.update_mode = 'hybrid'  # 'none', 'ca', 'hybrid', 'adaptive'
         self.steps_per_update = 1
-        self.update_mode = 'none'  # 'none', 'ca', 'enhance', 'sharpen'
-        self.ca_strength = 0.1  # How much CA affects the image (0-1)
+        self.ca_vs_clip = 0.5  # Balance between CA and CLIP (0=all CLIP, 1=all CA)
+        self.step_size = 0.1
         
-        # Initialize with visible pattern
+        # Initialize with seed
         self.reset_state()
     
     def reset_state(self):
-        """Reset image state with a sharper pattern"""
+        """Reset to initial seed state"""
         with torch.no_grad():
-            # Clear tensor
-            self.tensor.zero_()
+            # Clear state
+            self.state.zero_()
             
-            # Get dimensions
-            c, h, w = self.tensor.shape
+            # Create a seed at the center
+            h, w = self.state.shape[2:]
+            cx, cy = w // 2, h // 2
             
-            # Create pattern with sharper edges
-            y = torch.linspace(-1, 1, h).view(-1, 1).expand(-1, w)
-            x = torch.linspace(-1, 1, w).view(1, -1).expand(h, -1)
+            # Seed size
+            seed_size = min(h, w) // 10
+            seed_size = max(4, seed_size)  # At least 4 pixels
             
-            # Create circular distance from center
-            dist = torch.sqrt(x.pow(2) + y.pow(2)).clamp(0, 1)
+            # Set RGB to white
+            self.state[0, 0:3, cy-seed_size//2:cy+seed_size//2, cx-seed_size//2:cx+seed_size//2] = 1.0
             
-            # Create patterns with sharp edges
-            stripes_x = (torch.sin(x * 10 * np.pi) > 0).float()
-            stripes_y = (torch.sin(y * 10 * np.pi) > 0).float()
-            circles = ((dist * 10) % 1.0 > 0.5).float()
+            # Set alpha to alive
+            self.state[0, 3:4, cy-seed_size//2:cy+seed_size//2, cx-seed_size//2:cx+seed_size//2] = 1.0
             
-            # Combine for interesting sharp pattern
-            r = stripes_x * 0.8 + 0.2
-            g = stripes_y * 0.8 + 0.2
-            b = circles * 0.8 + 0.2
-            
-            # Set tensor values
-            self.tensor[0] = r  # Red
-            self.tensor[1] = g  # Green
-            self.tensor[2] = b  # Blue
-            
-            # Store original
-            self.original.copy_(self.tensor)
+            # Set some hidden state
+            if self.channel_n > 4:
+                self.state[0, 4:, cy-seed_size//2:cy+seed_size//2, cx-seed_size//2:cx+seed_size//2] = 0.1
     
     def clone(self):
         """Create a clone of this image"""
         width, height = self.image_shape
-        clone = GNCAImage(width, height, self.scale)
+        clone = GNCAImage(width, height, self.scale, self.channel_n)
         with torch.no_grad():
-            clone.tensor.copy_(self.tensor)
-            clone.original.copy_(self.original)
-            clone.steps_per_update = self.steps_per_update
+            clone.state.copy_(self.state)
+            clone.ca_model.load_state_dict(self.ca_model.state_dict())
             clone.update_mode = self.update_mode
-            clone.ca_strength = self.ca_strength
+            clone.steps_per_update = self.steps_per_update
+            clone.ca_vs_clip = self.ca_vs_clip
+            clone.step_size = self.step_size
         return clone
     
     def decode_tensor(self):
-        """Returns tensor in the expected output format"""
-        return self.tensor
+        """Returns RGB tensor for display"""
+        # Extract RGB from state and apply alpha premultiplication
+        rgb = self.state[0, 0:3]
+        alpha = torch.sigmoid(self.state[0, 3:4])
+        
+        # Background color (white)
+        bg_color = torch.ones_like(rgb)
+        
+        # Composite with white background
+        composite = alpha * rgb + (1 - alpha) * bg_color
+        
+        return composite
     
     def get_image_tensor(self):
         """Return tensor for transformations"""
-        return self.tensor
+        # Just return RGB+hidden state without batch dimension
+        return self.state[0]
     
     def set_image_tensor(self, tensor):
         """Set from tensor"""
         with torch.no_grad():
-            self.tensor.copy_(tensor)
+            self.state[0].copy_(tensor)
     
     def encode_image(self, pil_image, smart_encode=True, device=DEVICE):
-        """Set from target image with enhanced sharpness"""
+        """Set from target image"""
         # Convert PIL image to tensor
         img_tensor = TF.to_tensor(pil_image).to(device)
         
-        # Resize if needed - use NEAREST for sharper resizing
-        c, h, w = self.tensor.shape
+        # Resize if needed
+        h, w = self.state.shape[2:]
         if img_tensor.shape[1] != h or img_tensor.shape[2] != w:
             img_tensor = F.interpolate(
                 img_tensor.unsqueeze(0),
                 size=(h, w),
-                mode='nearest'
+                mode='bilinear',
+                align_corners=False
             ).squeeze(0)
         
-        # Optional: Enhance contrast for even sharper look
-        if smart_encode:
-            # Enhance sharpness
-            img_tensor = self._enhance_sharpness(img_tensor)
-        
-        # Set tensor
+        # Set RGB channels
         with torch.no_grad():
-            self.tensor.copy_(img_tensor)
-            self.original.copy_(img_tensor)  # Store original for reference
-    
-    def _enhance_sharpness(self, img):
-        """Enhance the sharpness of an image tensor"""
-        # 1. Increase contrast
-        mean = img.mean()
-        img = (img - mean) * 1.3 + mean
-        
-        # 2. Apply sharpening kernel
-        kernel = torch.tensor([[-1, -1, -1], 
-                              [-1,  9, -1], 
-                              [-1, -1, -1]], dtype=torch.float32, device=img.device) / 9.0
-        kernel = kernel.view(1, 1, 3, 3).repeat(1, 1, 1, 1)
-        
-        channels = []
-        for i in range(img.shape[0]):
-            ch = img[i:i+1].unsqueeze(0)
-            ch = F.conv2d(ch, kernel, padding=1)
-            channels.append(ch.squeeze(0))
-        
-        img = torch.cat(channels, dim=0).clamp(0, 1)
-        return img
+            self.state[0, 0:3].copy_(img_tensor)
+            
+            # Set alpha based on brightness (bright areas = alive)
+            brightness = img_tensor.mean(dim=0, keepdim=True)
+            alpha = (brightness > 0.2).float() * 2.0 - 1.0  # Convert to logits
+            self.state[0, 3:4].copy_(alpha)
+            
+            # Initialize hidden state in alive areas
+            if self.channel_n > 4 and smart_encode:
+                alive_mask = (brightness > 0.2).float()
+                for i in range(4, self.channel_n):
+                    # Different frequencies for different channels
+                    freq = i / 2.0
+                    y = torch.linspace(0, h-1, h).view(-1, 1).expand(-1, w) / h
+                    x = torch.linspace(0, w-1, w).view(1, -1).expand(h, -1) / w
+                    pattern = torch.sin(x * freq * np.pi) * torch.sin(y * freq * np.pi) * 0.5
+                    self.state[0, i].copy_(pattern * alive_mask)
     
     def encode_random(self):
-        """Fill with random data - make it high contrast"""
+        """Initialize with random values"""
         with torch.no_grad():
-            # Generate random noise
-            self.tensor.uniform_()
+            # Random RGB
+            self.state[0, 0:3].uniform_(0, 1)
             
-            # Apply quantization for sharper appearance
-            self.tensor = (self.tensor > 0.5).float()
+            # Random alive areas (sparse)
+            alpha = torch.zeros_like(self.state[0, 3:4])
+            alpha.bernoulli_(0.1)  # 10% alive cells
+            self.state[0, 3:4] = alpha * 2.0 - 1.0  # Convert to logits
             
-            # Store as original
-            self.original.copy_(self.tensor)
-    
-    def set_steps_per_update(self, steps):
-        """Set animation speed"""
-        self.steps_per_update = steps
+            # Random hidden state
+            if self.channel_n > 4:
+                self.state[0, 4:].uniform_(-0.1, 0.1)
     
     def set_update_mode(self, mode):
-        """Set animation style"""
-        if mode in ['none', 'ca', 'enhance', 'sharpen']:
+        """Set the update mode"""
+        valid_modes = ['none', 'ca', 'hybrid', 'adaptive']
+        if mode in valid_modes:
             self.update_mode = mode
     
+    def set_steps_per_update(self, steps):
+        """Set number of CA steps per update"""
+        self.steps_per_update = max(1, steps)
+    
     def set_ca_strength(self, strength):
-        """Set how strongly the CA affects the image (0-1)"""
-        self.ca_strength = max(0.0, min(1.0, strength))
+        """Set balance between CA and CLIP (0-1)"""
+        self.ca_vs_clip = max(0.0, min(1.0, strength))
     
-    def _apply_conway_rules(self, channel):
-        """Apply Conway's Game of Life rules"""
-        # Count neighbors (including diagonals)
-        kernel = torch.ones(1, 1, 3, 3, device=channel.device)
-        kernel[0, 0, 1, 1] = 0  # Don't count the cell itself
-        
-        # Count alive neighbors
-        neighbors = F.conv2d(channel, kernel, padding=1)
-        
-        # Conway's rules
-        # 1. Any live cell with 2 or 3 live neighbors survives
-        # 2. Any dead cell with exactly 3 live neighbors becomes alive
-        # 3. All other cells die or stay dead
-        
-        # We threshold the channel to get binary live/dead state
-        alive = (channel > 0.5).float()
-        
-        # Apply rules
-        new_state = ((alive == 1) & ((neighbors == 2) | (neighbors == 3))) | ((alive == 0) & (neighbors == 3))
-        return new_state.float()
+    def set_step_size(self, step_size):
+        """Set CA update step size"""
+        self.step_size = max(0.01, min(1.0, step_size))
     
-    @torch.no_grad()
     def update(self):
-        """Run animation effect with improved modes"""
+        """Update image state"""
+        # If no update, do nothing
         if self.update_mode == 'none':
-            return  # Do nothing for static images
+            return
             
-        for _ in range(self.steps_per_update):
-            if self.update_mode == 'ca':
-                # Better cellular automata that preserves image structure
+        # Save original state for hybrid mode
+        if self.update_mode == 'hybrid':
+            # Remember gradient contributions from CLIP
+            original_state = self.state.clone()
+            
+        # Apply CA updates
+        if self.update_mode in ['ca', 'hybrid', 'adaptive']:
+            for _ in range(self.steps_per_update):
+                self.state.copy_(self.ca_model(self.state, self.step_size))
+        
+        # For hybrid mode, blend CA result with original CLIP gradients
+        if self.update_mode == 'hybrid':
+            # Blend based on ca_vs_clip ratio
+            with torch.no_grad():
+                self.state.copy_(
+                    self.ca_vs_clip * self.state + 
+                    (1.0 - self.ca_vs_clip) * original_state
+                )
+        
+        # For adaptive mode, adjust based on current state
+        if self.update_mode == 'adaptive':
+            # Adaptive behavior based on alive cell ratio
+            with torch.no_grad():
+                alive_ratio = torch.sigmoid(self.state[0, 3:4]).mean()
                 
-                # Work with thresholded version for CA
-                thresholded = (self.tensor > self.tensor.mean(dim=(1, 2), keepdim=True)).float()
+                # If too few alive cells, reduce CA influence
+                if alive_ratio < 0.1:
+                    self.ca_vs_clip = max(0.1, self.ca_vs_clip * 0.9)
                 
-                # Apply CA rules to each channel
-                new_channels = []
-                for i in range(3):
-                    channel = thresholded[i:i+1].unsqueeze(0)  # Add batch dim
-                    new_state = self._apply_conway_rules(channel)
-                    new_channels.append(new_state.squeeze(0))
-                
-                # Blend with original based on strength
-                for i in range(3):
-                    # Use original colors but new patterns
-                    self.tensor[i:i+1] = self.tensor[i:i+1] * (1 - self.ca_strength) + \
-                                         new_channels[i] * self.tensor[i:i+1].mean() * self.ca_strength
-                
-            elif self.update_mode == 'enhance':
-                # Subtle enhancement that improves the image over time
-                
-                # 1. Apply subtle sharpening
-                kernel = torch.tensor([[-0.1, -0.1, -0.1], 
-                                       [-0.1,  1.8, -0.1], 
-                                       [-0.1, -0.1, -0.1]], dtype=torch.float32, device=self.tensor.device) / 1.0
-                kernel = kernel.view(1, 1, 3, 3)
-                
-                channels = []
-                for i in range(3):
-                    channel = self.tensor[i:i+1].unsqueeze(0)
-                    enhanced = F.conv2d(channel, kernel, padding=1)
-                    channels.append(enhanced.squeeze(0))
-                
-                # Blend with current image
-                for i in range(3):
-                    self.tensor[i:i+1] = self.tensor[i:i+1] * 0.9 + channels[i] * 0.1
-                
-                # 2. Increase local contrast
-                for i in range(3):
-                    # Calculate local mean
-                    local_mean = F.avg_pool2d(
-                        self.tensor[i:i+1].unsqueeze(0), 
-                        kernel_size=7, 
-                        stride=1, 
-                        padding=3
-                    ).squeeze(0)
-                    
-                    # Increase contrast relative to local mean
-                    self.tensor[i:i+1] = (self.tensor[i:i+1] - local_mean) * 1.1 + local_mean
-                
-                # Clamp values
-                self.tensor.clamp_(0, 1)
-                
-            elif self.update_mode == 'sharpen':
-                # Progressive sharpening that maintains structure
-                
-                # Create a version with increased edge contrast
-                sobel_x = torch.tensor([[-1.0, 0.0, 1.0], 
-                                       [-2.0, 0.0, 2.0], 
-                                       [-1.0, 0.0, 1.0]], device=self.tensor.device).view(1, 1, 3, 3)
-                sobel_y = torch.tensor([[-1.0, -2.0, -1.0], 
-                                       [0.0, 0.0, 0.0], 
-                                       [1.0, 2.0, 1.0]], device=self.tensor.device).view(1, 1, 3, 3)
-                
-                edges = torch.zeros_like(self.tensor)
-                
-                for i in range(3):
-                    channel = self.tensor[i:i+1].unsqueeze(0)
-                    edges_x = F.conv2d(channel, sobel_x, padding=1)
-                    edges_y = F.conv2d(channel, sobel_y, padding=1)
-                    edge_mag = torch.sqrt(edges_x.pow(2) + edges_y.pow(2)).squeeze(0)
-                    edges[i:i+1] = edge_mag
-                
-                # Create an edge-enhanced version
-                edge_enhanced = self.tensor + edges * 0.2
-                
-                # Blend with original
-                self.tensor.copy_(torch.lerp(self.tensor, edge_enhanced.clamp(0, 1), 0.1))
+                # If too many alive cells, increase CA influence
+                elif alive_ratio > 0.5:
+                    self.ca_vs_clip = min(0.9, self.ca_vs_clip * 1.1)
     
     # Required for compatibility
     def image_loss(self):
