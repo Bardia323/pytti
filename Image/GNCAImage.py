@@ -8,292 +8,259 @@ from torchvision.transforms import functional as TF
 from PIL import Image
 import numpy as np
 
-class CAModel(nn.Module):
-    """Neural Cellular Automata model that's fully differentiable"""
-    
-    def __init__(self, channel_n=16, hidden_n=128, device=DEVICE):
-        super().__init__()
-        self.channel_n = channel_n
-        
-        # Perception kernels for edge detection (3×3×channel_n)
-        # IMPORTANT: Explicitly put kernels on the specified device
-        self.register_buffer('identity', torch.tensor([0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0], 
-                                   dtype=torch.float32, device=device).reshape(1, 1, 3, 3))
-        self.register_buffer('sobel_x', torch.tensor([1.0, 2.0, 1.0, 0.0, 0.0, 0.0, -1.0, -2.0, -1.0], 
-                                   dtype=torch.float32, device=device).reshape(1, 1, 3, 3) / 8.0)
-        self.register_buffer('sobel_y', torch.tensor([1.0, 0.0, -1.0, 2.0, 0.0, -2.0, 1.0, 0.0, -1.0], 
-                                   dtype=torch.float32, device=device).reshape(1, 1, 3, 3) / 8.0)
-        
-        # Neural update network (fully differentiable)
-        self.update_net = nn.Sequential(
-            nn.Conv2d(channel_n * 3, hidden_n, 1),
-            nn.ReLU(),
-            nn.Conv2d(hidden_n, channel_n, 1)
-        )
-        
-        # Initialize last layer to zeros for stability
-        with torch.no_grad():
-            self.update_net[-1].weight.zero_()
-            self.update_net[-1].bias.zero_()
-    
-    def perceive(self, x):
-        """Apply perception kernels to state"""
-        batch, c, h, w = x.shape
-        
-        # Split into separate channels
-        identity_out = []
-        sobel_x_out = []
-        sobel_y_out = []
-        
-        # Apply convolutions to each channel
-        for i in range(c):
-            # Extract one channel
-            channel = x[:, i:i+1]
-            
-            # Apply the three perception kernels
-            identity_out.append(F.conv2d(channel, self.identity, padding=1))
-            sobel_x_out.append(F.conv2d(channel, self.sobel_x, padding=1))
-            sobel_y_out.append(F.conv2d(channel, self.sobel_y, padding=1))
-        
-        # Concatenate results for all channels
-        identity_out = torch.cat(identity_out, dim=1)
-        sobel_x_out = torch.cat(sobel_x_out, dim=1)
-        sobel_y_out = torch.cat(sobel_y_out, dim=1)
-        
-        # Stack all perception features
-        perception = torch.cat([identity_out, sobel_x_out, sobel_y_out], dim=1)
-        return perception
-    
-    def forward(self, x, step_size=0.1):
-        """Perform one CA update step"""
-        # Get perception features
-        perception = self.perceive(x)
-        
-        # Apply update network
-        update = self.update_net(perception) * step_size
-        
-        # Apply update (residual connection)
-        x = x + update
-        
-        # Get alive mask (alpha channel if available, otherwise use mean)
-        if x.shape[1] > 3:
-            alive_mask = torch.sigmoid(x[:, 3:4]) > 0.1
-        else:
-            # For RGB-only, use mean brightness
-            alive_mask = x.mean(dim=1, keepdim=True) > 0.1
-            
-        return x * alive_mask.float()
-
 class GNCAImage(DifferentiableImage):
     """
-    Growing Neural Cellular Automata image for Pytti
+    GNCA-inspired image class with enhanced optimization
     """
     
     @vram_usage_mode('GNCA Image')
-    def __init__(self, width, height, scale=1, channel_n=16, device=DEVICE):
+    def __init__(self, width, height, scale=1, **kwargs):
         super().__init__(width, height)
         self.scale = scale
-        self.channel_n = channel_n
         
-        # Create tensor for RGB + hidden channels
-        # First 4 channels are RGBA, rest are hidden state
-        self.state = nn.Parameter(torch.zeros(1, channel_n, height, width, device=device))
+        # Create tensor in RGB format
+        self.tensor = nn.Parameter(torch.zeros(3, height, width, device=DEVICE))
         
-        # Create the CA model
-        self.ca_model = CAModel(channel_n, hidden_n=128, device=device)
-        
-        # CRITICAL: Match expected axes format
+        # CRITICAL: Match the exact axes format from DifferentiableImage
         self.output_axes = ('s', 'y', 'x')
         
-        # Parameters
-        self.update_mode = 'hybrid'  # 'none', 'ca', 'hybrid', 'adaptive'
+        # Animation parameters
         self.steps_per_update = 1
-        self.ca_vs_clip = 0.5  # Balance between CA and CLIP (0=all CLIP, 1=all CA)
-        self.step_size = 0.1
+        self.update_mode = 'none'  # 'none', 'ca', 'edge'
         
-        # Initialize with seed
+        # Optimization parameters
+        self.momentum = 0.9
+        self.growth_threshold = 0.1
+        self.update_threshold = 0.5
+        self.local_lr_scale = 2.0
+        
+        # Register buffers for optimization state
+        self.register_buffer('grad_momentum', torch.zeros_like(self.tensor))
+        self.register_buffer('update_mask', torch.ones_like(self.tensor[0:1]))
+        self.register_buffer('active_regions', torch.ones_like(self.tensor[0:1]))
+        
+        # Initialize with visible pattern
         self.reset_state()
     
     def reset_state(self):
-        """Reset to initial seed state"""
+        """Reset image state with a sharper pattern"""
         with torch.no_grad():
-            # Clear state
-            self.state.zero_()
+            # Clear tensor and optimization state
+            self.tensor.zero_()
+            self.grad_momentum.zero_()
+            self.update_mask.fill_(1.0)
+            self.active_regions.fill_(1.0)
             
-            # Create a seed at the center
-            h, w = self.state.shape[2:]
-            cx, cy = w // 2, h // 2
+            # Get dimensions
+            c, h, w = self.tensor.shape
             
-            # Seed size
-            seed_size = min(h, w) // 10
-            seed_size = max(4, seed_size)  # At least 4 pixels
+            # Create pattern with sharper edges
+            y = torch.linspace(-1, 1, h).view(-1, 1).expand(-1, w)
+            x = torch.linspace(-1, 1, w).view(1, -1).expand(h, -1)
             
-            # Set RGB to white
-            self.state[0, 0:3, cy-seed_size//2:cy+seed_size//2, cx-seed_size//2:cx+seed_size//2] = 1.0
+            # Create circular distance from center
+            dist = torch.sqrt(x.pow(2) + y.pow(2)).clamp(0, 1)
             
-            # Set alpha to alive (using logits, so >0 means alive)
-            self.state[0, 3:4, cy-seed_size//2:cy+seed_size//2, cx-seed_size//2:cx+seed_size//2] = 5.0  # Strong positive for definitely alive
+            # Create patterns with sharp edges (using step functions)
+            stripes_x = (torch.sin(x * 10 * np.pi) > 0).float()
+            stripes_y = (torch.sin(y * 10 * np.pi) > 0).float()
+            circles = ((dist * 10) % 1.0 > 0.5).float()
             
-            # Set some hidden state
-            if self.channel_n > 4:
-                self.state[0, 4:, cy-seed_size//2:cy+seed_size//2, cx-seed_size//2:cx+seed_size//2] = 0.1
+            # Combine for interesting sharp pattern
+            r = stripes_x * 0.8 + 0.2
+            g = stripes_y * 0.8 + 0.2
+            b = circles * 0.8 + 0.2
+            
+            # Set tensor values
+            self.tensor[0] = r  # Red
+            self.tensor[1] = g  # Green
+            self.tensor[2] = b  # Blue
+            
+            # Define initial active regions (center)
+            self.active_regions = (dist < 0.5).float().unsqueeze(0)
     
     def clone(self):
         """Create a clone of this image"""
         width, height = self.image_shape
-        clone = GNCAImage(width, height, self.scale, self.channel_n)
+        clone = GNCAImage(width, height, self.scale)
         with torch.no_grad():
-            clone.state.copy_(self.state)
-            clone.ca_model.load_state_dict(self.ca_model.state_dict())
-            clone.update_mode = self.update_mode
+            clone.tensor.copy_(self.tensor)
+            clone.grad_momentum.copy_(self.grad_momentum)
+            clone.update_mask.copy_(self.update_mask)
+            clone.active_regions.copy_(self.active_regions)
             clone.steps_per_update = self.steps_per_update
-            clone.ca_vs_clip = self.ca_vs_clip
-            clone.step_size = self.step_size
+            clone.update_mode = self.update_mode
+            clone.momentum = self.momentum
+            clone.growth_threshold = self.growth_threshold
+            clone.update_threshold = self.update_threshold
+            clone.local_lr_scale = self.local_lr_scale
         return clone
     
     def decode_tensor(self):
-        """Returns RGB tensor for display"""
-        # Extract RGB from state and apply alpha for display
-        rgb = self.state[0, 0:3]
-        
-        # Alpha is stored as logits, convert to probability with sigmoid
-        alpha = torch.sigmoid(self.state[0, 3:4])
-        
-        # Background color (white)
-        bg_color = torch.ones_like(rgb)
-        
-        # Composite with white background (fix for inversion)
-        composite = rgb * alpha + bg_color * (1 - alpha)
-        
-        return composite
+        """Returns tensor in the expected output format"""
+        return self.tensor
     
     def get_image_tensor(self):
         """Return tensor for transformations"""
-        # Just return RGB+hidden state without batch dimension
-        return self.state[0]
+        return self.tensor
     
     def set_image_tensor(self, tensor):
         """Set from tensor"""
         with torch.no_grad():
-            self.state[0].copy_(tensor)
+            self.tensor.copy_(tensor)
     
     def encode_image(self, pil_image, smart_encode=True, device=DEVICE):
-        """Set from target image"""
+        """Set from target image with enhanced sharpness"""
         # Convert PIL image to tensor
         img_tensor = TF.to_tensor(pil_image).to(device)
         
-        # Resize if needed
-        h, w = self.state.shape[2:]
+        # Resize if needed - use NEAREST for sharper resizing
+        c, h, w = self.tensor.shape
         if img_tensor.shape[1] != h or img_tensor.shape[2] != w:
             img_tensor = F.interpolate(
                 img_tensor.unsqueeze(0),
                 size=(h, w),
-                mode='bilinear',
-                align_corners=False
+                mode='nearest'
             ).squeeze(0)
         
-        # Set RGB channels
+        # Optional: Enhance contrast for even sharper look
+        if smart_encode:
+            # Simple contrast enhancement
+            mean = img_tensor.mean()
+            img_tensor = (img_tensor - mean) * 1.2 + mean
+            img_tensor = img_tensor.clamp(0, 1)
+        
+        # Set tensor
         with torch.no_grad():
-            self.state[0, 0:3].copy_(img_tensor)
+            self.tensor.copy_(img_tensor)
             
-            # Set alpha based on brightness (bright areas = alive)
+            # Calculate active regions based on brightness
             brightness = img_tensor.mean(dim=0, keepdim=True)
-            
-            # Convert to logits: values > 0.2 become alive (>0 in logit space)
-            # Using strong logit values for clearer separation
-            alpha_mask = (brightness > 0.2).float()
-            alpha_logits = alpha_mask * 5.0 - (1.0 - alpha_mask) * 5.0  # 5.0 for alive, -5.0 for dead
-            
-            self.state[0, 3:4].copy_(alpha_logits)
-            
-            # Initialize hidden state in alive areas
-            if self.channel_n > 4 and smart_encode:
-                # Make sure alive_mask has correct shape: [h, w] not [1, h, w]
-                alive_mask = alpha_mask.squeeze(0)  # Remove extra dim
-                target_device = self.state.device
-                
-                for i in range(4, self.channel_n):
-                    # Different frequencies for different channels
-                    freq = i / 2.0
-                    # Create tensors on the correct device
-                    y = torch.linspace(0, h-1, h, device=target_device).view(-1, 1).expand(-1, w) / h
-                    x = torch.linspace(0, w-1, w, device=target_device).view(1, -1).expand(h, -1) / w
-                    pattern = torch.sin(x * freq * np.pi) * torch.sin(y * freq * np.pi) * 0.5
-                    # Make sure pattern and alive_mask have same shape before multiplying
-                    self.state[0, i].copy_(pattern * alive_mask)
+            edges = F.max_pool2d(brightness.unsqueeze(0), 3, stride=1, padding=1) - \
+                    F.avg_pool2d(brightness.unsqueeze(0), 3, stride=1, padding=1)
+            self.active_regions = (edges.squeeze(0) > edges.mean() * 1.5).float()
     
     def encode_random(self):
-        """Initialize with random values"""
+        """Fill with random data - make it high contrast"""
         with torch.no_grad():
-            # Random RGB
-            self.state[0, 0:3].uniform_(0, 1)
+            # Binary noise for sharper appearance
+            self.tensor.bernoulli_(0.5)
             
-            # Random alive areas (sparse)
-            alive_mask = torch.zeros_like(self.state[0, 3:4])
-            alive_mask.bernoulli_(0.1)  # 10% alive cells
-            alpha_logits = alive_mask * 5.0 - (1.0 - alive_mask) * 5.0  # Strong logits
-            self.state[0, 3:4].copy_(alpha_logits)
-            
-            # Random hidden state
-            if self.channel_n > 4:
-                self.state[0, 4:].uniform_(-0.1, 0.1)
-    
-    def set_update_mode(self, mode):
-        """Set the update mode"""
-        valid_modes = ['none', 'ca', 'hybrid', 'adaptive']
-        if mode in valid_modes:
-            self.update_mode = mode
+            # Random active regions
+            self.active_regions.bernoulli_(0.2)
+            # Grow active regions slightly for connectivity
+            self.active_regions = F.max_pool2d(
+                self.active_regions.unsqueeze(0), 5, stride=1, padding=2
+            ).squeeze(0)
     
     def set_steps_per_update(self, steps):
-        """Set number of CA steps per update"""
-        self.steps_per_update = max(1, steps)
+        """Set animation speed"""
+        self.steps_per_update = steps
     
-    def set_ca_strength(self, strength):
-        """Set balance between CA and CLIP (0-1)"""
-        self.ca_vs_clip = max(0.0, min(1.0, strength))
+    def set_update_mode(self, mode):
+        """Set animation style"""
+        if mode in ['none', 'ca', 'edge']:
+            self.update_mode = mode
     
-    def set_step_size(self, step_size):
-        """Set CA update step size"""
-        self.step_size = max(0.01, min(1.0, step_size))
+    def set_optimizer_params(self, momentum=0.9, growth_threshold=0.1, 
+                            update_threshold=0.5, local_lr_scale=2.0):
+        """Configure the enhanced optimizer"""
+        self.momentum = momentum
+        self.growth_threshold = growth_threshold
+        self.update_threshold = update_threshold
+        self.local_lr_scale = local_lr_scale
     
+    @torch.no_grad()
     def update(self):
-        """Update image state"""
-        # If no update, do nothing
-        if self.update_mode == 'none':
-            return
+        """Enhanced update with improved optimization"""
+        # Process gradients if available - optimized update
+        if self.tensor.grad is not None:
+            # Apply momentum to gradients
+            self.grad_momentum.mul_(self.momentum).add_(self.tensor.grad, alpha=1-self.momentum)
             
-        # Save original state for hybrid mode
-        if self.update_mode == 'hybrid':
-            # Remember gradient contributions from CLIP
-            original_state = self.state.clone()
+            # Calculate gradient magnitude
+            grad_mag = torch.norm(self.grad_momentum, dim=0, keepdim=True)
             
-        # Apply CA updates
-        if self.update_mode in ['ca', 'hybrid', 'adaptive']:
+            # Update active regions based on gradient magnitudes
+            active_update = (grad_mag > grad_mag.mean() * self.growth_threshold).float()
+            self.active_regions = torch.max(
+                self.active_regions, 
+                F.max_pool2d(active_update, 3, stride=1, padding=1)
+            )
+            
+            # Adaptive learning rate mask based on active regions
+            lr_mask = self.active_regions * self.local_lr_scale + (1 - self.active_regions) * 0.1
+            
+            # Apply local learning rate scaling to gradients
+            local_grad = self.tensor.grad * lr_mask
+            
+            # Clear gradients to avoid double-application
+            self.tensor.grad.zero_()
+            
+            # Manually apply gradients with our custom modifications
+            self.tensor.add_(-local_grad * 0.01)  # Apply small step
+            
+            # Ensure tensor values stay in valid range
+            self.tensor.clamp_(0, 1)
+        
+        # Apply normal CA updates if not in 'none' mode
+        if self.update_mode != 'none':            
             for _ in range(self.steps_per_update):
-                self.state.copy_(self.ca_model(self.state, self.step_size))
-        
-        # For hybrid mode, blend CA result with original CLIP gradients
-        if self.update_mode == 'hybrid':
-            # Blend based on ca_vs_clip ratio
-            with torch.no_grad():
-                self.state.copy_(
-                    self.ca_vs_clip * self.state + 
-                    (1.0 - self.ca_vs_clip) * original_state
-                )
-        
-        # For adaptive mode, adjust based on current state
-        if self.update_mode == 'adaptive':
-            # Adaptive behavior based on alive cell ratio
-            with torch.no_grad():
-                alive_ratio = torch.sigmoid(self.state[0, 3:4]).mean()
-                
-                # If too few alive cells, reduce CA influence
-                if alive_ratio < 0.1:
-                    self.ca_vs_clip = max(0.1, self.ca_vs_clip * 0.9)
-                
-                # If too many alive cells, increase CA influence
-                elif alive_ratio > 0.5:
-                    self.ca_vs_clip = min(0.9, self.ca_vs_clip * 1.1)
+                if self.update_mode == 'ca':
+                    # Apply cellular automata-like update
+                    kernel_size = 3
+                    kernel = torch.ones(1, 1, kernel_size, kernel_size, device=self.tensor.device) / (kernel_size**2)
+                    
+                    # Only update active regions
+                    update_region = F.max_pool2d(self.active_regions.unsqueeze(0), 5, stride=1, padding=2).squeeze(0)
+                    
+                    # Apply convolution to each channel separately
+                    channels = []
+                    for i in range(3):
+                        channel = self.tensor[i:i+1].unsqueeze(0)  # Add batch dim
+                        blurred = F.conv2d(channel, kernel, padding=kernel_size//2)
+                        channels.append(blurred.squeeze(0))
+                    
+                    # Make sharper edges by applying a step function
+                    for i in range(3):
+                        # Threshold the blurred values for sharp transitions
+                        threshold = channels[i].mean()
+                        # Add a small random noise to prevent static patterns
+                        rand_noise = torch.randn_like(channels[i]) * 0.05
+                        new_val = ((channels[i] + rand_noise) > threshold).float()
+                        
+                        # Only apply updates to active regions
+                        self.tensor[i:i+1] = self.tensor[i:i+1] * (1 - update_region) + \
+                                            new_val * update_region
+                    
+                elif self.update_mode == 'edge':
+                    # Edge detection for sharp transitions
+                    # Sobel filters for edge detection - ensure proper type
+                    sobel_x = torch.tensor([[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]], 
+                                          device=self.tensor.device).view(1, 1, 3, 3)
+                    sobel_y = torch.tensor([[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]], 
+                                          device=self.tensor.device).view(1, 1, 3, 3)
+                    
+                    # Only update active regions
+                    update_region = F.max_pool2d(self.active_regions.unsqueeze(0), 5, stride=1, padding=2).squeeze(0)
+                    
+                    for i in range(3):
+                        channel = self.tensor[i:i+1].unsqueeze(0)
+                        edges_x = F.conv2d(channel, sobel_x, padding=1)
+                        edges_y = F.conv2d(channel, sobel_y, padding=1)
+                        edges = torch.sqrt(edges_x.pow(2) + edges_y.pow(2))
+                        
+                        # Threshold edges for binary edge map
+                        edge_threshold = edges.mean() * 2
+                        edge_mask = (edges > edge_threshold).float()
+                        
+                        # Compute new values by inverting edge regions
+                        new_val = self.tensor[i:i+1] * (1 - edge_mask.squeeze(0)) + \
+                                (1 - self.tensor[i:i+1]) * edge_mask.squeeze(0)
+                        
+                        # Only apply updates to active regions
+                        self.tensor[i:i+1] = self.tensor[i:i+1] * (1 - update_region) + \
+                                            new_val * update_region
     
     # Required for compatibility
     def image_loss(self):
