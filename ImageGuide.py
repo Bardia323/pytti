@@ -164,7 +164,14 @@ class DirectImageGuide():
             else:
                 self.dataframe[0] = pd.concat([self.dataframe[0], pd.DataFrame(loss_dict, index=[i])])
 
+        # First do the backward pass
         total_loss.backward()
+        
+        # Apply gradient clipping if enabled
+        if self.grad_clip is not None:
+            torch.nn.utils.clip_grad_norm_(self.image_rep.parameters(), self.grad_clip)
+        
+        # Apply the optimizer step
         self.optimizer.step()
         self.image_rep.update()
 
@@ -175,9 +182,10 @@ class EnhancedImageGuide(DirectImageGuide):
     Enhanced version of DirectImageGuide with support for:
     1. Multiple optimizer types (Adam, AdamW, RAdam, Lookahead)
     2. Adaptive loss weighting
+    3. Gradient clipping to prevent exploding gradients
     """
     def __init__(self, image_rep, embedder, optimizer_name='adam', lr=None, adaptive_weights=False, 
-                 weight_update_freq=10, weight_scale_factor=0.5, **optimizer_params):
+                 weight_update_freq=10, weight_scale_factor=0.5, grad_clip=1.0, **optimizer_params):
         """
         image_rep: The image representation to optimize
         embedder: The embedder to use for image-text comparison
@@ -186,6 +194,7 @@ class EnhancedImageGuide(DirectImageGuide):
         adaptive_weights: Whether to use adaptive loss weighting
         weight_update_freq: How often to update loss weights (in steps)
         weight_scale_factor: How strongly to adjust weights (0-1)
+        grad_clip: Maximum norm for gradient clipping (None to disable)
         """
         self.image_rep = image_rep
         self.embedder = embedder
@@ -200,6 +209,7 @@ class EnhancedImageGuide(DirectImageGuide):
         self.adaptive_weights = adaptive_weights
         self.weight_update_freq = weight_update_freq
         self.weight_scale_factor = weight_scale_factor
+        self.grad_clip = grad_clip
         self.loss_history = {}
         self.initial_weights = {}
         
@@ -488,6 +498,10 @@ class EnhancedImageGuide(DirectImageGuide):
 
         # First do the backward pass
         total_loss.backward()
+        
+        # Apply gradient clipping if enabled
+        if self.grad_clip is not None:
+            torch.nn.utils.clip_grad_norm_(self.image_rep.parameters(), self.grad_clip)
         
         # Apply the optimizer step
         self.optimizer.step()
