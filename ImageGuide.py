@@ -249,15 +249,27 @@ class EnhancedImageGuide(DirectImageGuide):
         if not self.initial_weights:
             for prompt, loss in prompt_losses.items():
                 if hasattr(prompt, 'weight'):
-                    self.initial_weights[str(prompt)] = prompt.weight.clone()
+                    # Handle both tensor and non-tensor weights
+                    if hasattr(prompt.weight, 'clone'):
+                        self.initial_weights[str(prompt)] = prompt.weight.clone()
+                    else:
+                        self.initial_weights[str(prompt)] = prompt.weight
             
             for aug, loss in aug_losses.items():
                 if hasattr(aug, 'weight'):
-                    self.initial_weights[str(aug)] = aug.weight.clone()
+                    # Handle both tensor and non-tensor weights
+                    if hasattr(aug.weight, 'clone'):
+                        self.initial_weights[str(aug)] = aug.weight.clone()
+                    else:
+                        self.initial_weights[str(aug)] = aug.weight
             
             for aug, loss in image_losses.items():
                 if hasattr(aug, 'weight'):
-                    self.initial_weights[str(aug)] = aug.weight.clone()
+                    # Handle both tensor and non-tensor weights
+                    if hasattr(aug.weight, 'clone'):
+                        self.initial_weights[str(aug)] = aug.weight.clone()
+                    else:
+                        self.initial_weights[str(aug)] = aug.weight
     
     def _update_loss_weights(self, i, prompt_losses, aug_losses, image_losses):
         """Adaptively adjust loss weights based on their magnitudes"""
@@ -313,11 +325,21 @@ class EnhancedImageGuide(DirectImageGuide):
                     
                     # Apply adjustment with limit
                     initial_weight = self.initial_weights.get(str(prompt), prompt.weight)
-                    new_weight = float(prompt.weight) * (1.0 + min(max(adjust, -0.2), 0.2))
+                    
+                    # Handle both tensor and non-tensor weights
+                    current_weight = float(prompt.weight) if not hasattr(prompt.weight, 'item') else prompt.weight.item()
+                    new_weight = current_weight * (1.0 + min(max(adjust, -0.2), 0.2))
+                    
+                    # Get initial weight as float
+                    init_weight_val = float(initial_weight) if not hasattr(initial_weight, 'item') else initial_weight.item()
                     
                     # Don't let weight go below 20% or above 500% of initial
-                    new_weight = max(min(new_weight, float(initial_weight) * 5.0), float(initial_weight) * 0.2)
-                    prompt.set_weight(new_weight)
+                    new_weight = max(min(new_weight, init_weight_val * 5.0), init_weight_val * 0.2)
+                    
+                    try:
+                        prompt.set_weight(new_weight)
+                    except Exception as e:
+                        print(f"Warning: Could not set weight for {prompt}: {e}")
         
         # Same for augmentation losses
         for aug, loss in {**aug_losses, **image_losses}.items():
@@ -332,10 +354,23 @@ class EnhancedImageGuide(DirectImageGuide):
                     ratio = mean_of_means / mean_loss
                     adjust = (ratio - 1.0) * self.weight_scale_factor
                     
+                    # Apply adjustment with limit
                     initial_weight = self.initial_weights.get(str(aug), aug.weight)
-                    new_weight = float(aug.weight) * (1.0 + min(max(adjust, -0.2), 0.2))
-                    new_weight = max(min(new_weight, float(initial_weight) * 5.0), float(initial_weight) * 0.2)
-                    aug.set_weight(new_weight)
+                    
+                    # Handle both tensor and non-tensor weights
+                    current_weight = float(aug.weight) if not hasattr(aug.weight, 'item') else aug.weight.item()
+                    new_weight = current_weight * (1.0 + min(max(adjust, -0.2), 0.2))
+                    
+                    # Get initial weight as float
+                    init_weight_val = float(initial_weight) if not hasattr(initial_weight, 'item') else initial_weight.item()
+                    
+                    # Don't let weight go below 20% or above 500% of initial
+                    new_weight = max(min(new_weight, init_weight_val * 5.0), init_weight_val * 0.2)
+                    
+                    try:
+                        aug.set_weight(new_weight)
+                    except Exception as e:
+                        print(f"Warning: Could not set weight for {aug}: {e}")
     
     def train(self, i, prompts, interp_prompts, loss_augs, interp_steps=0, save_loss=True):
         """Performs a training step with adaptive weight adjustment."""
