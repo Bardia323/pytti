@@ -442,10 +442,14 @@ class EnhancedImageGuide(DirectImageGuide):
             if new_width != self.image_rep.width or new_height != self.image_rep.height:
                 old_size = (self.image_rep.width, self.image_rep.height)
                 self.image_rep.set_resolution(new_width, new_height)
-                print(f"Resolution changed from {old_size} to ({new_width}, {new_height})")
+                # Don't print resolution changes - makes output cleaner
+                # print(f"Resolution changed from {old_size} to ({new_width}, {new_height})")
                 
                 # Need to recreate optimizer when tensor shapes change
                 self._create_optimizer()
+                
+                # Make sure image is updated visually
+                self.image_rep.update()
         
         elif hasattr(self.image_rep, 'size') and hasattr(self.image_rep, 'set_size'):
             new_size = max(32, int(self.original_resolution * scale_factor))
@@ -454,10 +458,14 @@ class EnhancedImageGuide(DirectImageGuide):
             if new_size != self.image_rep.size:
                 old_size = self.image_rep.size
                 self.image_rep.set_size(new_size)
-                print(f"Resolution changed from {old_size} to {new_size}")
+                # Don't print resolution changes - makes output cleaner
+                # print(f"Resolution changed from {old_size} to {new_size}")
                 
                 # Need to recreate optimizer when tensor shapes change
                 self._create_optimizer()
+                
+                # Make sure image is updated visually
+                self.image_rep.update()
     
     def _update_resolution(self, i):
         """Update resolution based on current step"""
@@ -476,15 +484,10 @@ class EnhancedImageGuide(DirectImageGuide):
     def reset_to_full_resolution(self):
         """Reset to full resolution after training"""
         if self.progressive_growing and self.original_resolution:
-            print("Resetting to full resolution for final output")
+            # Set to full resolution for final output
             self._set_current_resolution(1.0)
-            # Run a few optimizer steps at full resolution to clean up
-            for _ in range(3):
-                self.optimizer.zero_grad()
-                z = self.image_rep.decode_training_tensor()
-                z = z.mean()  # Small dummy loss
-                z.backward()
-                self.optimizer.step()
+            
+            # Force visible update of image
             self.image_rep.update()
     
     def train(self, i, prompts, interp_prompts, loss_augs, interp_steps=0, save_loss=True):
