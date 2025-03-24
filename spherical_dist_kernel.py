@@ -174,34 +174,87 @@ class FastSphericalDistanceLoss(nn.Module):
     def forward(self, x, y):
         """
         Calculate spherical distance between x and y.
-        x: Tensor of shape [batch_size, embedding_dim]
-        y: Tensor of shape [batch_size, embedding_dim] or [1, embedding_dim]
+        x: Tensor of any shape that can be reshaped to [batch_size, embedding_dim]
+        y: Tensor of any shape that can be reshaped to [batch_size, embedding_dim] or [1, embedding_dim]
         """
         if not self.use_cuda:
             # Fallback implementation using F.normalize
+            return self._spherical_dist_fallback(x, y)
+        
+        # Reshape inputs to 2D if needed
+        original_shape = x.shape
+        original_y_shape = y.shape
+        
+        try:
+            if x.dim() != 2:
+                # Reshape to [batch_size, embedding_dim]
+                last_dim = x.shape[-1]
+                x = x.reshape(-1, last_dim)
+                print(f"Reshaped x from {original_shape} to {x.shape}")
+            
+            if y.dim() != 2:
+                # Reshape to [batch_size or 1, embedding_dim]
+                last_dim = y.shape[-1]
+                y = y.reshape(-1, last_dim)
+                print(f"Reshaped y from {original_y_shape} to {y.shape}")
+        except Exception as e:
+            print(f"Error reshaping tensors: {e}")
+            print(f"x shape: {x.shape}, y shape: {y.shape}")
             return self._spherical_dist_fallback(x, y)
         
         # Convert to float32 if needed - CUDA kernel requires float32
         x_float = x.float() if x.dtype != torch.float32 else x
         y_float = y.float() if y.dtype != torch.float32 else y
         
-        # Use the CUDA kernel
-        if y.size(0) == 1 and x.size(0) > 1:
-            result = spherical_dist_cuda.spherical_dist_loss_batch(x_float, y_float)
-        else:
-            result = spherical_dist_cuda.spherical_dist_loss(x_float, y_float)
+        try:
+            # Use the CUDA kernel
+            if y.size(0) == 1 and x.size(0) > 1:
+                result = spherical_dist_cuda.spherical_dist_loss_batch(x_float, y_float)
+            else:
+                result = spherical_dist_cuda.spherical_dist_loss(x_float, y_float)
+        except RuntimeError as e:
+            print(f"CUDA kernel error: {e}")
+            print(f"x shape: {x.shape}, dtype: {x.dtype}")
+            print(f"y shape: {y.shape}, dtype: {y.dtype}")
+            print(f"Falling back to PyTorch implementation")
+            # Fall back to PyTorch implementation
+            return self._spherical_dist_fallback(x, y)
             
         # Convert result back to original dtype if needed
         if x.dtype != torch.float32:
             result = result.to(x.dtype)
+        
+        # Reshape result back to original batch dimensions if needed
+        if original_shape != x.shape:
+            # The result shape should be original_shape without the last dimension
+            result_shape = original_shape[:-1]
+            result = result.reshape(result_shape)
             
         return result
     
     def _spherical_dist_fallback(self, x, y):
         """Original PyTorch implementation for fallback"""
+        # Save original shapes
+        original_x_shape = x.shape
+        original_y_shape = y.shape
+        
+        # Reshape if needed
+        if x.dim() != 2:
+            x = x.reshape(-1, x.shape[-1])
+        if y.dim() != 2:
+            y = y.reshape(-1, y.shape[-1])
+            
+        # Normalize and compute distance
         x = F.normalize(x, dim=-1)
         y = F.normalize(y, dim=-1)
-        return x.sub(y).norm(dim=-1).div(2).arcsin().pow(2).mul(2)
+        result = x.sub(y).norm(dim=-1).div(2).arcsin().pow(2).mul(2)
+        
+        # Reshape result back if needed
+        if original_x_shape != x.shape:
+            result_shape = original_x_shape[:-1]
+            result = result.reshape(result_shape)
+            
+        return result
 
 def patch_spherical_dist():
     """
