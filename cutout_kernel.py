@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.cpp_extension import load, CUDAExtension
+import kornia.augmentation as K
 
 # Check if CUDA is available
 if not torch.cuda.is_available():
@@ -245,6 +246,16 @@ class FastCutoutGenerator(nn.Module):
         self.std = 0.3
         self.min_size_ratio = 0.05  # Minimum cutout size ratio
         
+        # Add augmentations to match the original implementation
+        self.augs = nn.Sequential(
+            K.RandomHorizontalFlip(p=0.3),
+            K.RandomAffine(degrees=30, translate=0.1, p=0.8, padding_mode='border'),
+            K.RandomPerspective(0.2, p=0.4,),
+            K.ColorJitter(hue=0.01, saturation=0.01, p=0.7),
+            K.RandomErasing(scale=(.1, .4), ratio=(.3, 1/.3), same_on_batch=False, p=0.7),
+            nn.Identity(),
+        )
+        
         # Choose between CUDA or fallback implementation
         self.use_cuda = CUDA_EXTENSION_LOADED
         if self.use_cuda:
@@ -296,18 +307,17 @@ class FastCutoutGenerator(nn.Module):
             cutout = input[:, :, offsety:offsety + size, offsetx:offsetx + size]
             cutouts.append(F.adaptive_avg_pool2d(cutout, cut_size))
             
-        # Stack cutouts
+        # Stack cutouts and apply augmentations
         cutouts = torch.cat(cutouts)
+        cutouts = self.augs(cutouts)
         
         # Format offsets and sizes like the original implementation
         offsets = torch.stack([
             torch.stack([offsetsx, offsetsy], dim=1)
-            for _ in range(self.cutn)
         ]).to(device)
         
         sizes_tensor = torch.stack([
             torch.stack([sizes, sizes], dim=1)
-            for _ in range(self.cutn)
         ]).to(device)
         
         # Add noise if requested
@@ -350,7 +360,10 @@ class FastCutoutGenerator(nn.Module):
             offsets.append(torch.as_tensor([[offsetx/side_x, offsety/side_y]]).to(device))
             sizes.append(torch.as_tensor([[size/side_x, size/side_y]]).to(device))
             
+        # Stack cutouts and apply augmentations
         cutouts = torch.cat(cutouts)
+        cutouts = self.augs(cutouts)
+        
         offsets = torch.cat(offsets)
         sizes = torch.cat(sizes)
         
