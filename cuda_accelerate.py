@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from torch.cuda.amp import autocast, GradScaler
 from functools import wraps
+from pytti import format_input
 
 class MixedPrecisionTraining:
     """
