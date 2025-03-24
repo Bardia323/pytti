@@ -226,9 +226,18 @@ try:
             CUDA_EXTENSION_LOADED = True
             
         except Exception as e:
-            if "Ninja is required" in str(e):
+            error_message = str(e)
+            if "Ninja is required" in error_message:
                 print("Ninja build system not found. You can install it with:")
                 print("  pip install ninja")
+                print("Using fallback implementation instead.")
+            elif "CUDA_HOME environment variable is not set" in error_message:
+                print("CUDA_HOME environment variable is not set.")
+                print("Please set it to your CUDA install root, for example:")
+                if os.name == 'nt':  # Windows
+                    print("  SET CUDA_HOME=C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v11.6")
+                else:  # Linux/Mac
+                    print("  export CUDA_HOME=/usr/local/cuda-11.6")
                 print("Using fallback implementation instead.")
             else:
                 print(f"Failed to build CUDA extension: {e}")
@@ -326,13 +335,14 @@ class FastCutoutGenerator(nn.Module):
         cutouts = self.augs(cutouts)
         
         # Format offsets and sizes like the original implementation
-        offsets = torch.stack([
-            torch.stack([offsetsx, offsetsy], dim=1)
-        ]).to(device)
+        offsets_list = []
+        sizes_list = []
+        for i in range(self.cutn):
+            offsets_list.append(torch.as_tensor([[offsetsx[i].item()/side_x, offsetsy[i].item()/side_y]]).to(device))
+            sizes_list.append(torch.as_tensor([[sizes[i].item(), sizes[i].item()]]).to(device))
         
-        sizes_tensor = torch.stack([
-            torch.stack([sizes, sizes], dim=1)
-        ]).to(device)
+        offsets = torch.cat(offsets_list)
+        sizes_tensor = torch.cat(sizes_list)
         
         # Add noise if requested
         if self.noise_fac:
