@@ -208,21 +208,31 @@ try:
     
     # Load the custom extension if CUDA is available
     if CUDA_AVAILABLE:
-        # Write the CUDA code to a temporary file
-        cuda_file = os.path.join(build_dir, 'cutout_kernel.cu')
-        with open(cuda_file, 'w') as f:
-            f.write(cuda_source)
-        
-        # Load the extension with JIT compilation
-        cutout_cuda = load(
-            name='cutout_cuda',
-            sources=[cuda_file],
-            build_directory=build_dir,
-            verbose=True
-        )
-        
-        # Load successful
-        CUDA_EXTENSION_LOADED = True
+        try:
+            # Write the CUDA code to a temporary file
+            cuda_file = os.path.join(build_dir, 'cutout_kernel.cu')
+            with open(cuda_file, 'w') as f:
+                f.write(cuda_source)
+            
+            # Load the extension with JIT compilation
+            cutout_cuda = load(
+                name='cutout_cuda',
+                sources=[cuda_file],
+                build_directory=build_dir,
+                verbose=True
+            )
+            
+            # Load successful
+            CUDA_EXTENSION_LOADED = True
+            
+        except Exception as e:
+            if "Ninja is required" in str(e):
+                print("Ninja build system not found. You can install it with:")
+                print("  pip install ninja")
+                print("Using fallback implementation instead.")
+            else:
+                print(f"Failed to build CUDA extension: {e}")
+            CUDA_EXTENSION_LOADED = False
     else:
         CUDA_EXTENSION_LOADED = False
         
@@ -277,6 +287,10 @@ class FastCutoutGenerator(nn.Module):
         if not self.use_cuda:
             # Fallback implementation using PyTorch ops
             return self._make_cutouts_fallback(input, side_x, side_y, cut_size, device)
+        
+        # Calculate proper min_size_ratio based on original implementation
+        max_size = min(side_x, side_y)
+        min_size_ratio = cut_size / max_size  # Match original code's minimum size constraint
             
         # Generate random parameters for cutouts
         params = cutout_cuda.generate_cutout_params(
@@ -286,7 +300,7 @@ class FastCutoutGenerator(nn.Module):
             self.mean,
             self.std,
             self.cut_pow,
-            self.min_size_ratio,
+            min_size_ratio,  # Use calculated value instead of hardcoded 0.05
             torch.randint(0, 2**31 - 1, (1,), device='cuda').item()
         )
         
@@ -338,6 +352,7 @@ class FastCutoutGenerator(nn.Module):
         sizes = []
         
         for _ in range(self.cutn):
+            # Use clip with cut_size/max_size as minimum, exactly like original implementation
             size = int(max_size * 
                    torch.zeros(1,).normal_(mean=self.mean, std=self.std)
                    .clip(cut_size/max_size, 1.) ** self.cut_pow)
