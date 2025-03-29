@@ -97,7 +97,7 @@ class PixelImage(DifferentiableImage):
     Differentiable image format for pixel art images.
     """
     @vram_usage_mode('Limited Palette Image')
-    def __init__(self, width, height, scale, pallet_size, n_pallets, gamma=0.7, hdr_weight=0.5, norm_weight=0.1, device=DEVICE):
+    def __init__(self, width, height, scale, pallet_size, n_pallets, gamma=1, hdr_weight=0.5, norm_weight=0.1, device=DEVICE):
         super().__init__(width * scale, height * scale)
         self.pallet_inertia = 2
         # Initialize palette with gamma=1 (no correction) initially
@@ -116,8 +116,8 @@ class PixelImage(DifferentiableImage):
         self.use_pallet_target = False
         # Store target gamma for gradual application
         self.target_gamma = gamma
-        self.current_gamma = 1.3
-        self.gamma_step = 0.02  # Faster gamma approach
+        self.current_gamma = 1.0
+        self.gamma_step = 0.01  # How quickly to approach target gamma
 
     def clone(self):
         width, height = self.image_shape
@@ -181,7 +181,7 @@ class PixelImage(DifferentiableImage):
         gamma_corrected_pallet = pallet
         if self.current_gamma != 1.0:
             # Apply gamma correction to palette values
-            gamma_corrected_pallet = pallet.pow(1/self.current_gamma)  # Use inverse gamma for display
+            gamma_corrected_pallet = pallet.pow(self.current_gamma)
 
         # Brightness values of pixels
         values = self.value.clamp(0, 1) * (self.pallet_size - 1)
@@ -210,10 +210,6 @@ class PixelImage(DifferentiableImage):
             size=(height, width),
             mode='nearest'
         )
-
-        # Boost final brightness by 15%
-        colors_disc = colors_disc.clamp(0, 1) * 1.15
-        colors_cont = colors_cont.clamp(0, 1) * 1.15
 
         return replace_grad(colors_disc, colors_cont * 0.5 + colors_disc * 0.5)
 
@@ -312,8 +308,7 @@ class PixelImage(DifferentiableImage):
           # Step 2: Quantize self.value into pallet_size levels
           pallet_size = self.pallet_size
           n_pallets = self.n_pallets
-          # Don't normalize by max value - use absolute brightness levels
-          value_quantized = (self.value * (pallet_size - 1)).long()
+          value_quantized = ((self.value / self.value.max()) * (pallet_size - 1)).long()
           value_quantized = value_quantized.clamp(0, pallet_size - 1)
 
           # Step 3: Compute normalized colors
@@ -348,11 +343,10 @@ class PixelImage(DifferentiableImage):
 
               # Step 5: Set new_pallet
               brightness_value = (i / (pallet_size - 1))
-              # Scale palette by 1.2 to make it brighter
-              new_pallet[i, :n_clusters, :] = cluster_centers * brightness_value * 1.2
+              new_pallet[i, :n_clusters, :] = cluster_centers * brightness_value
               if n_clusters < n_pallets:
                   # Fill remaining pallets with the last cluster center
-                  new_pallet[i, n_clusters:, :] = cluster_centers[-1] * brightness_value * 1.2
+                  new_pallet[i, n_clusters:, :] = cluster_centers[-1] * brightness_value
 
               # Step 6: Assign new_tensor
               indices = torch.nonzero(mask).squeeze()
@@ -370,6 +364,7 @@ class PixelImage(DifferentiableImage):
           # Assign new tensors to self.pallet and self.tensor
           self.pallet.copy_(new_pallet)
           self.tensor.copy_(new_tensor)
+
 
     @torch.no_grad()
     def encode_random(self, random_pallet=False):
