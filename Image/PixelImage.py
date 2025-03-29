@@ -211,7 +211,12 @@ class PixelImage(DifferentiableImage):
             mode='nearest'
         )
 
-        return replace_grad(colors_disc, colors_cont * 0.5 + colors_disc * 0.5)
+        # Blend for better brightness preservation, with emphasis on continuous representation
+        final_output = replace_grad(colors_disc, colors_cont * 0.7 + colors_disc * 0.3)
+        
+        # Apply a slight boost to prevent darkness
+        brightness_boost = 1.1  # Adjust this value as needed
+        return final_output * brightness_boost
 
     @torch.no_grad()
     def render_value_image(self):
@@ -268,29 +273,6 @@ class PixelImage(DifferentiableImage):
         self.tensor.copy_(self.tensor.clamp(0, float('inf')))
         return self.get_image_tensor()
 
-    def encode_image_old(self, pil_image, smart_encode=True, device=DEVICE):
-        width, height = self.image_shape
-
-        scale = self.scale
-        color_ref = pil_image.resize((width // scale, height // scale), Image.LANCZOS)
-        color_ref = TF.to_tensor(color_ref).to(device)
-        with torch.no_grad():
-            # Calculate grayscale values
-            magic_color = self.pallet.new_tensor([[[0.299]], [[0.587]], [[0.114]]])
-            value_ref = torch.linalg.vector_norm(color_ref * magic_color.sqrt(), dim=0)
-            self.value.copy_(value_ref)
-
-        if smart_encode:
-            mse = HSVLoss.TargetImage('HSV loss', self.image_shape, pil_image)
-
-            if self.hdr_loss is not None:
-                before_weight = self.hdr_loss.weight.clone()
-                self.hdr_loss.set_weight(0.01)
-            guide = DirectImageGuide(self, None, optimizer=optim.Adam([self.pallet, self.tensor], lr=0.1))
-            guide.run_steps(100, [], [], [mse])  # Reduced from 201 to 100 steps
-            if self.hdr_loss is not None:
-                self.hdr_loss.set_weight(before_weight)
-
     def encode_image(self, pil_image, smart_encode=True, device=DEVICE):
       width, height = self.image_shape
 
@@ -308,7 +290,11 @@ class PixelImage(DifferentiableImage):
           # Step 2: Quantize self.value into pallet_size levels
           pallet_size = self.pallet_size
           n_pallets = self.n_pallets
-          value_quantized = ((self.value / self.value.max()) * (pallet_size - 1)).long()
+          
+          # Store max brightness value to preserve original image brightness
+          max_brightness = self.value.max()
+          
+          value_quantized = ((self.value / max_brightness) * (pallet_size - 1)).long()
           value_quantized = value_quantized.clamp(0, pallet_size - 1)
 
           # Step 3: Compute normalized colors
@@ -341,8 +327,8 @@ class PixelImage(DifferentiableImage):
               labels = kmeans.fit_predict(colors.cpu().numpy())
               cluster_centers = torch.tensor(kmeans.cluster_centers_, device=device)
 
-              # Step 5: Set new_pallet
-              brightness_value = (i / (pallet_size - 1))
+              # Step 5: Set new_pallet with correct brightness preservation
+              brightness_value = (i / (pallet_size - 1)) * max_brightness
               new_pallet[i, :n_clusters, :] = cluster_centers * brightness_value
               if n_clusters < n_pallets:
                   # Fill remaining pallets with the last cluster center
@@ -365,6 +351,22 @@ class PixelImage(DifferentiableImage):
           self.pallet.copy_(new_pallet)
           self.tensor.copy_(new_tensor)
 
+          # If smart_encode is enabled, further refine the image with HSV loss
+          if smart_encode:
+              mse = HSVLoss.TargetImage('HSV loss', self.image_shape, pil_image)
+              
+              # Store original brightness parameters to restore later
+              if self.hdr_loss is not None:
+                  before_weight = self.hdr_loss.weight.clone()
+                  # Lower HDR weight during encoding to prevent darkening
+                  self.hdr_loss.set_weight(0.005)  # Reduced from 0.01
+                  
+              # Use a higher learning rate for better convergence
+              guide = DirectImageGuide(self, None, optimizer=optim.Adam([self.pallet, self.tensor], lr=0.15))
+              guide.run_steps(80, [], [], [mse])  # Reduced from 100 to 80 steps for better brightness preservation
+              
+              if self.hdr_loss is not None:
+                  self.hdr_loss.set_weight(before_weight)
 
     @torch.no_grad()
     def encode_random(self, random_pallet=False):
