@@ -11,7 +11,6 @@ from scipy.signal import savgol_filter
 import torch.optim as optim
 import matplotlib.pyplot as plt
 from pytti import format_input
-from .accelerate_pytti import apply_all_accelerations
 
 def unpack_dict(D, n=2):
     ds = [{k: V[i] for k, V in D.items()} for i in range(n)]
@@ -500,5 +499,3 @@ class EnhancedImageGuide(DirectImageGuide):
         self.image_rep.update()
 
         return {'TOTAL': float(total_loss)}
-
-apply_all_accelerations()
