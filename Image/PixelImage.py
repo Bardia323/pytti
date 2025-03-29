@@ -116,7 +116,7 @@ class PixelImage(DifferentiableImage):
         self.use_pallet_target = False
         # Store target gamma for gradual application
         self.target_gamma = gamma
-        self.current_gamma = 0.7
+        self.current_gamma = 1.3
         self.gamma_step = 0.02  # Faster gamma approach
 
     def clone(self):
