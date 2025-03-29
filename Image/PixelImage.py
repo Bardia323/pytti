@@ -303,19 +303,17 @@ class PixelImage(DifferentiableImage):
           # Step 1: Compute grayscale values (self.value)
           magic_color = torch.tensor([0.299, 0.587, 0.114], device=device).view(3, 1, 1)
           value_ref = (color_ref * magic_color).sum(dim=0)
-          
-          # Store original brightness values (no gamma correction for init image)
           self.value.copy_(value_ref)
 
           # Step 2: Quantize self.value into pallet_size levels
           pallet_size = self.pallet_size
           n_pallets = self.n_pallets
-          value_quantized = ((value_ref / value_ref.max()) * (pallet_size - 1)).long()
+          value_quantized = ((self.value / self.value.max()) * (pallet_size - 1)).long()
           value_quantized = value_quantized.clamp(0, pallet_size - 1)
 
           # Step 3: Compute normalized colors
           epsilon = 1e-6
-          normalized_color = color_ref / (value_ref.unsqueeze(0) + epsilon)
+          normalized_color = color_ref / (self.value.unsqueeze(0) + epsilon)
 
           # Prepare data for clustering
           normalized_color = normalized_color.permute(1, 2, 0).contiguous()  # H x W x 3
@@ -343,7 +341,7 @@ class PixelImage(DifferentiableImage):
               labels = kmeans.fit_predict(colors.cpu().numpy())
               cluster_centers = torch.tensor(kmeans.cluster_centers_, device=device)
 
-              # Step 5: Set new_pallet with original brightness (no gamma)
+              # Step 5: Set new_pallet
               brightness_value = (i / (pallet_size - 1))
               new_pallet[i, :n_clusters, :] = cluster_centers * brightness_value
               if n_clusters < n_pallets:
@@ -363,14 +361,10 @@ class PixelImage(DifferentiableImage):
           # Normalize new_tensor
           new_tensor = new_tensor.clamp(0, 1)
 
-          # Reset current gamma to 1.0 for fresh init image
-          self.current_gamma = 1.0
-          if self.hdr_loss is not None:
-              self.hdr_loss.gamma = 1.0
-
           # Assign new tensors to self.pallet and self.tensor
           self.pallet.copy_(new_pallet)
           self.tensor.copy_(new_tensor)
+
 
     @torch.no_grad()
     def encode_random(self, random_pallet=False):
