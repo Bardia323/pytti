@@ -22,7 +22,7 @@ class PalletLoss(nn.Module):
     def __init__(self, n_pallets, weight=0.15, device=DEVICE):
         super().__init__()
         self.n_pallets = n_pallets
-        self.register_buffer('weight', torch.as_tensor(weight, device=device))
+        self.register_buffer('weight', torch.as_tensor(weight, device=device, dtype=torch.float32))
 
     def forward(self, input):
         if isinstance(input, PixelImage):
@@ -46,7 +46,7 @@ class PalletLoss(nn.Module):
 
     @torch.no_grad()
     def set_weight(self, weight, device=DEVICE):
-        self.weight.set_(torch.as_tensor(weight, device=device))
+        self.weight.set_(torch.as_tensor(weight, device=device, dtype=torch.float32))
 
     def __str__(self):
         return "Palette normalization"
@@ -55,7 +55,7 @@ class HdrLoss(nn.Module):
     def __init__(self, pallet_size, n_pallets, gamma=2.5, weight=0.15, device=DEVICE):
         super().__init__()
         self.register_buffer('comp', torch.linspace(0, 1, pallet_size).pow(gamma).view(pallet_size, 1).repeat(1, n_pallets).to(device))
-        self.register_buffer('weight', torch.as_tensor(weight, device=device))
+        self.register_buffer('weight', torch.as_tensor(weight, device=device, dtype=torch.float32))
 
     def forward(self, input):
         if isinstance(input, PixelImage):
@@ -69,7 +69,7 @@ class HdrLoss(nn.Module):
 
     @torch.no_grad()
     def set_weight(self, weight, device=DEVICE):
-        self.weight.set_(torch.as_tensor(weight, device=device))
+        self.weight.set_(torch.as_tensor(weight, device=device, dtype=torch.float32))
 
     def __str__(self):
         return "HDR normalization"
