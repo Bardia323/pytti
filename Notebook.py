@@ -2,6 +2,7 @@
 #This file defines utility functions for use with notebooks.
 
 #https://stackoverflow.com/questions/15411967/how-can-i-check-if-code-is-executed-in-the-ipython-notebook
+import open_clip
 def is_notebook():
   try:
     shell = get_ipython().__class__.__name__
@@ -119,29 +120,106 @@ def save_batch(settings_list, path):
 
 
 CLIP_MODEL_NAMES = None
+
 def load_clip(params):
-  from pytti import Perceptor
-  global CLIP_MODEL_NAMES
-  if CLIP_MODEL_NAMES is not None:
-    last_names = CLIP_MODEL_NAMES
-  else:
-    last_names = []
-  CLIP_MODEL_NAMES = []
-  if params.RN50x4:
-    CLIP_MODEL_NAMES.append("RN50x4")
-  if params.RN50:
-    CLIP_MODEL_NAMES.append("RN50")
-  if params.ViTB32:
-    CLIP_MODEL_NAMES.append("ViT-B/32")
-  if params.ViTB16:
-    CLIP_MODEL_NAMES.append("ViT-B/16")
-  if last_names != CLIP_MODEL_NAMES or Perceptor.CLIP_PERCEPTORS is None:
+    from pytti import Perceptor
+    import torch 
+    import open_clip
+
+    # ------------------------------------------------------
+    # PART 1: Define Standard OpenAI Models
+    # ------------------------------------------------------
+    global CLIP_MODEL_NAMES
+    if CLIP_MODEL_NAMES is not None:
+        last_names = CLIP_MODEL_NAMES
+    else:
+        last_names = []
+    CLIP_MODEL_NAMES = []
+    
+    # Standard flags
+    if params.RN50x4:  CLIP_MODEL_NAMES.append("RN50x4")
+    if params.RN50:    CLIP_MODEL_NAMES.append("RN50")
+    if params.ViTB32:  CLIP_MODEL_NAMES.append("ViT-B/32")
+    if params.ViTB16:  CLIP_MODEL_NAMES.append("ViT-B/16")
+    if params.ConvNeXtLarge: CLIP_MODEL_NAMES.append("ConvNeXtLarge")
+    if params.DFN_ViT_H: CLIP_MODEL_NAMES.append("DFN_ViT_H")
+    if params.MetaCLIP_ViT_B: CLIP_MODEL_NAMES.append("MetaCLIP_ViT_B")
+    # ------------------------------------------------------
+    # PART 2: Check for Custom Models & Safety
+    # ------------------------------------------------------
+    # Check if any custom OpenCLIP models are in the list
+    custom_models = {"ConvNeXtLarge", "DFN_ViT_H", "MetaCLIP_ViT_B"}
+    custom_models_selected = bool(set(CLIP_MODEL_NAMES) & custom_models)
+
     if CLIP_MODEL_NAMES == []:
-      Perceptor.free_clip()
-      raise RuntimeError("Please select at least one CLIP model")
+        Perceptor.free_clip()
+        raise RuntimeError("Please select at least one CLIP model")
+
     Perceptor.free_clip()
     print("Loading CLIP...")
-    Perceptor.init_clip(CLIP_MODEL_NAMES)
+    
+    # Separate standard and custom models
+    custom_models = {"ConvNeXtLarge", "DFN_ViT_H", "MetaCLIP_ViT_B"}
+    standard_models = [m for m in CLIP_MODEL_NAMES if m not in custom_models]
+    
+    # Initialize standard OpenAI models (if any are selected)
+    if standard_models:
+        Perceptor.init_clip(standard_models)
+    else:
+        # Safety: Ensure the list exists if we skipped standard init
+        Perceptor.CLIP_PERCEPTORS = []
+    
+    # ------------------------------------------------------
+    # PART 3: Inject OpenCLIP Models (With Patch)
+    # ------------------------------------------------------
+    
+    if torch.cuda.is_available():
+        device = torch.device('cuda')
+    else:
+        device = torch.device('cpu')
+
+    # Helper function to fix the "input_resolution" crash
+    def patch_model_for_pytti(model):
+        if not hasattr(model.visual, 'input_resolution'):
+            # OpenCLIP uses 'image_size', Pytti expects 'input_resolution'
+            # We map one to the other manually.
+            if hasattr(model.visual, 'image_size'):
+                res = model.visual.image_size
+                # If it's a tuple (224, 224), take the first number
+                if isinstance(res, tuple): res = res[0]
+                model.visual.input_resolution = res
+        return model
+    
+    # 1. ConvNeXt-Large
+    if "ConvNeXtLarge" in CLIP_MODEL_NAMES:
+        print("Loading OpenCLIP: ConvNeXt-Large...")
+        model, _, _ = open_clip.create_model_and_transforms(
+            "convnext_large_d_320", 
+            pretrained="laion2b_s29b_b131k_ft_soup", 
+            device=device
+        )
+        Perceptor.CLIP_PERCEPTORS.append(patch_model_for_pytti(model))
+
+    # 2. DFN ViT-H-14
+    if "DFN_ViT_H" in CLIP_MODEL_NAMES:
+        print("Loading OpenCLIP: ViT-H-14 (DFN)...")
+        model, _, _ = open_clip.create_model_and_transforms(
+            "ViT-H-14-quickgelu", 
+            pretrained="dfn5b", 
+            device=device
+        )
+        Perceptor.CLIP_PERCEPTORS.append(patch_model_for_pytti(model))
+
+    # 3. MetaCLIP ViT-B-16
+    if "MetaCLIP_ViT_B" in CLIP_MODEL_NAMES:
+        print("Loading OpenCLIP: ViT-B-16 (MetaCLIP)...")
+        model, _, _ = open_clip.create_model_and_transforms(
+            "ViT-B-16-quickgelu", 
+            pretrained="metaclip_400m", 
+            device=device
+        )
+        Perceptor.CLIP_PERCEPTORS.append(patch_model_for_pytti(model))
+
     print("CLIP loaded.")
 
 def get_frames(path):
