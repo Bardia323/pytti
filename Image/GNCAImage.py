@@ -16,9 +16,9 @@ class CAModel(nn.Module):
         self.fire_rate = fire_rate
         
         # Perception kernels
-        self.register_buffer('identity', torch.tensor([0, 1, 0, 1, 0, 1, 0, 1, 0], dtype=torch.float32).reshape(3, 3))
-        self.register_buffer('dx', torch.tensor([1, 2, 1, 0, 0, 0, -1, -2, -1], dtype=torch.float32).reshape(3, 3) / 8.0)
-        self.register_buffer('dy', torch.tensor([1, 0, -1, 2, 0, -2, 1, 0, -1], dtype=torch.float32).reshape(3, 3) / 8.0)
+        self.register_buffer('identity', torch.tensor([0, 0, 0, 0, 1, 0, 0, 0, 0], dtype=torch.float32).reshape(3, 3))
+        self.register_buffer('dx', torch.tensor([-1, 0, 1, -2, 0, 2, -1, 0, 1], dtype=torch.float32).reshape(3, 3) / 8.0)
+        self.register_buffer('dy', torch.tensor([-1, -2, -1, 0, 0, 0, 1, 2, 1], dtype=torch.float32).reshape(3, 3) / 8.0)
         
         # Update network
         self.dmodel = nn.Sequential(
@@ -30,30 +30,20 @@ class CAModel(nn.Module):
         self.dmodel[-1].weight.data.zero_()
     
     def perceive(self, x, angle=0.0):
-        """Apply perception kernels to the input tensor"""
-        batch_size, c, h, w = x.shape
-        
-        # Prepare kernels
-        identity = self.identity
-        dx, dy = self.dx, self.dy
+        """Apply perception kernels to the input tensor (depthwise Sobel + identity)"""
+        identity, dx, dy = self.identity, self.dx, self.dy
         
         # Apply rotation if needed
         if angle != 0.0:
             c, s = torch.cos(torch.tensor(angle)), torch.sin(torch.tensor(angle))
-            new_dx = c * dx - s * dy
-            new_dy = s * dx + c * dy
-            dx, dy = new_dx, new_dy
+            dx, dy = c * dx - s * dy, s * dx + c * dy
         
-        # Stack kernels for all channels
-        kernel = torch.stack([identity, dx, dy], dim=0)  # [3, 3, 3]
-        kernel = kernel.reshape(3, 1, 3, 3).repeat(1, self.channel_n, 1, 1)  # [3, channel_n, 3, 3]
-        kernel = kernel.reshape(3 * self.channel_n, 1, 3, 3)
+        # Build depthwise kernel: each input channel gets [identity, dx, dy]
+        base = torch.stack([identity, dx, dy], dim=0)           # [3, 3, 3]
+        w = base.repeat(self.channel_n, 1, 1)                   # [3*cn, 3, 3]
+        w = w.reshape(3 * self.channel_n, 1, 3, 3)              # [3*cn, 1, 3, 3]
         
-        # Apply convolution
-        x = x.reshape(batch_size * self.channel_n, 1, h, w)
-        y = F.conv2d(x, kernel, padding=1, groups=self.channel_n)
-        y = y.reshape(batch_size, 3 * self.channel_n, h, w)
-        return y
+        return F.conv2d(x, w.to(x.dtype), padding=1, groups=self.channel_n)
     
     def get_living_mask(self, x):
         """Determine which cells are alive based on alpha channel"""
