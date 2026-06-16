@@ -322,8 +322,11 @@ class PixelImage(DifferentiableImage):
           normalized_color = normalized_color.view(-1, 3)
           value_quantized_flat = value_quantized.view(-1)
 
-          # Initialize new tensors for self.pallet and self.tensor
-          new_pallet = torch.zeros_like(self.pallet)
+          # Prefill a grayscale brightness ramp so EVERY level is populated and brightness-monotonic.
+          # Empty levels left at 0 make sort_pallet reorder rows and scramble colours (esp. reds).
+          _ramp = (torch.arange(pallet_size, device=device, dtype=self.pallet.dtype)
+                   / max(1, pallet_size - 1) * self.pallet_inertia).view(pallet_size, 1, 1)
+          new_pallet = _ramp.repeat(1, n_pallets, 3).contiguous()
           new_tensor = torch.zeros_like(self.tensor)
 
           # Step 4: Cluster colors per brightness level
