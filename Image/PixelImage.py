@@ -114,10 +114,12 @@ class PixelImage(DifferentiableImage):
         self.loss = PalletLoss(n_pallets, norm_weight)
         self.register_buffer('pallet_target', torch.empty_like(self.pallet))
         self.use_pallet_target = False
-        # Store target gamma for gradual application
+        # Store target gamma. Start AT the target so the very first frame already shows the
+        # intended gamma/saturation (the old 1.0 start ramped up over ~120 frames, making the
+        # init look washed-out until it "caught up").
         self.target_gamma = gamma
-        self.current_gamma = 1.0
-        self.gamma_step = 0.01  # How quickly to approach target gamma
+        self.current_gamma = gamma
+        self.gamma_step = 0.01  # How quickly to approach target gamma (now a no-op unless lowered)
 
     def clone(self):
         width, height = self.image_shape
