@@ -308,7 +308,9 @@ class PixelImage(DifferentiableImage):
           # Step 2: Quantize self.value into pallet_size levels
           pallet_size = self.pallet_size
           n_pallets = self.n_pallets
-          value_quantized = ((self.value / self.value.max()) * (pallet_size - 1)).long()
+          # quantize by TRUE luma (decode indexes the palette by true luma, not value/max);
+          # also avoids a divide-by-zero on all-black images
+          value_quantized = (self.value.clamp(0, 1) * (pallet_size - 1)).long()
           value_quantized = value_quantized.clamp(0, pallet_size - 1)
 
           # Step 3: Compute normalized colors
@@ -343,10 +345,12 @@ class PixelImage(DifferentiableImage):
 
               # Step 5: Set new_pallet
               brightness_value = (i / (pallet_size - 1))
-              new_pallet[i, :n_clusters, :] = cluster_centers * brightness_value
+              # scale by pallet_inertia so decode's (pallet / pallet_inertia) reproduces the
+              # original colour instead of halving it (encode/decode round-trip fix)
+              new_pallet[i, :n_clusters, :] = cluster_centers * brightness_value * self.pallet_inertia
               if n_clusters < n_pallets:
                   # Fill remaining pallets with the last cluster center
-                  new_pallet[i, n_clusters:, :] = cluster_centers[-1] * brightness_value
+                  new_pallet[i, n_clusters:, :] = cluster_centers[-1] * brightness_value * self.pallet_inertia
 
               # Step 6: Assign new_tensor
               indices = torch.nonzero(mask).squeeze()
