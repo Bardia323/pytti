@@ -293,7 +293,7 @@ class PixelImage(DifferentiableImage):
             if self.hdr_loss is not None:
                 self.hdr_loss.set_weight(before_weight)
 
-    def encode_image(self, pil_image, smart_encode=True, device=DEVICE):
+    def encode_image(self, pil_image, smart_encode=True, device=DEVICE, saturation=1.0):
       width, height = self.image_shape
 
       scale = self.scale
@@ -347,6 +347,10 @@ class PixelImage(DifferentiableImage):
               kmeans = KMeans(n_clusters=n_clusters, n_init=1, max_iter=10, random_state=0)
               labels = kmeans.fit_predict(colors.cpu().numpy())
               cluster_centers = torch.tensor(kmeans.cluster_centers_, device=device)
+              if saturation != 1.0:
+                  # boost chroma away from gray (1,1,1) to counter palette desaturation;
+                  # preserves luma (both gray and chroma have luma 1), so brightness is unchanged
+                  cluster_centers = 1.0 + saturation * (cluster_centers - 1.0)
 
               # Step 5: Set new_pallet
               brightness_value = (i / (pallet_size - 1))
