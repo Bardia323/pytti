@@ -311,10 +311,10 @@ class PixelImage(DifferentiableImage):
             self.current_gamma = min(self.current_gamma + self.gamma_step, self.target_gamma)
             if self.hdr_loss is not None:
                 self.hdr_loss.gamma = self.current_gamma
-        self.pallet.copy_(self.pallet.clamp(0, self.pallet_inertia))
-        self.value.copy_(self.value.clamp(0, 1))
-        self.tensor.copy_(self.tensor.clamp(0, float('inf')))
-        return self.get_image_tensor()
+        # in place (the old clamp-then-copy made two passes over ~n_pallets*H*W values each step)
+        self.pallet.clamp_(0, self.pallet_inertia)
+        self.value.clamp_(0, 1)
+        self.tensor.clamp_(min=0)
 
     def encode_image_old(self, pil_image, smart_encode=True, device=DEVICE):
         width, height = self.image_shape
