@@ -192,16 +192,29 @@ class Prompt(nn.Module):
     if not self.enabled or self.weight in ['0',0]:
       return torch.as_tensor(offset, device=device), offset
     dists_raw = spherical_dist_loss(embed, self.embeds) + offset
-    weight = torch.as_tensor(parametric_eval(self.weight), device=device)
-    stop   = torch.as_tensor(parametric_eval(self.stop),   device=device)
+    # weight/stop stay Python floats: turning them into CUDA tensors every call was a blocking
+    # host->device copy (a full stream sync) per prompt per step
+    weight = float(parametric_eval(self.weight))
+    stop   = float(parametric_eval(self.stop))
 
     mask_stops, mask_weights = self.mask(position, size, embed.detach())
-    weight = torch.as_tensor(mask_weights, device = device) * weight
-    sign_offset = weight.sign().clamp(max=0)
+    if not torch.is_tensor(mask_stops):
+      mask_stops = torch.as_tensor(mask_stops, device=device)
+    if torch.is_tensor(mask_weights):
+      # per-cutout weights (image masks) are already on the GPU
+      weight = mask_weights.to(device) * weight
+      sign = weight.sign()
+      sign_offset = sign.clamp(max=0)
+      weight = weight.abs()
+    else:
+      weight = float(mask_weights) * weight
+      sign = float((weight > 0) - (weight < 0))
+      sign_offset = min(sign, 0.0)
+      weight = abs(weight)
 
-    dists = dists_raw*weight.sign()
-    stops = torch.maximum(mask_stops+sign_offset, stop)
-    dists = weight.abs() * replace_grad(dists, torch.maximum(dists, stops))
+    dists = dists_raw*sign
+    stops = (mask_stops+sign_offset).clamp(min=stop)
+    dists = weight * replace_grad(dists, torch.maximum(dists, stops))
     return dists.mean(), dists_raw.mean()
 
 class MultiClipImagePrompt(Prompt):

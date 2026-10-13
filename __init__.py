@@ -92,8 +92,22 @@ clamp_with_grad = ClampWithGrad.apply
 def clamp_grad(input, min, max):
   return replace_grad(input.clamp(min,max), input)
 
-normalize = transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
-                                 std=[0.26862954, 0.26130258, 0.27577711])
+class _ClipNormalize:
+  """CLIP input normalisation with mean/std cached per device+dtype. torchvision's Normalize
+  builds both tensors from Python lists on every call -- a blocking host->device copy each."""
+  mean = [0.48145466, 0.4578275, 0.40821073]
+  std  = [0.26862954, 0.26130258, 0.27577711]
+  def __init__(self):
+    self._cache = {}
+  def __call__(self, x):
+    key = (x.device, x.dtype)
+    if key not in self._cache:
+      self._cache[key] = (torch.tensor(self.mean, device=x.device, dtype=x.dtype).view(-1, 1, 1),
+                          torch.tensor(self.std,  device=x.device, dtype=x.dtype).view(-1, 1, 1))
+    m, s = self._cache[key]
+    return (x - m) / s
+
+normalize = _ClipNormalize()
 
 math_env = None
 global_t = 0

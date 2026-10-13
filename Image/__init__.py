@@ -99,9 +99,12 @@ class DifferentiableImage(nn.Module):
     """
     render a PIL Image version of this image
     """
-    tensor = self.decode_tensor()
-    tensor = named_rearrange(tensor, self.output_axes, ('y', 'x', 's'))
-    array = tensor.mul(255).clamp(0, 255).cpu().detach().numpy().astype(np.uint8)[:,:,:]
+    with torch.no_grad():
+      tensor = self.decode_tensor()
+      tensor = named_rearrange(tensor, self.output_axes, ('y', 'x', 's'))
+      # quantize on the GPU and copy 8-bit: 1/4 of the bytes over PCIe and no CPU-side float->uint8
+      # pass (same values: .to(uint8) truncates exactly like numpy's astype)
+      array = tensor.mul(255).clamp(0, 255).to(torch.uint8).contiguous().cpu().numpy()
     return Image.fromarray(array)
 
   def forward(self):

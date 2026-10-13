@@ -33,11 +33,12 @@ class Loss(nn.Module):
     if not self.enabled or self.weight in [0,'0']:
       return 0, 0
 
-    weight = torch.as_tensor(parametric_eval(self.weight), device=device)
-    stop   = torch.as_tensor(parametric_eval(self.stop),   device=device)
+    # Python floats, not CUDA tensors: no blocking host->device copy per loss per step
+    weight = float(parametric_eval(self.weight))
+    stop   = float(parametric_eval(self.stop))
     loss_raw = self.get_loss(input, img)
-    loss  =  loss_raw * weight.sign()
-    return weight.abs() * replace_grad(loss, torch.maximum(loss, stop)), loss_raw
+    loss  =  loss_raw * float((weight > 0) - (weight < 0))
+    return abs(weight) * replace_grad(loss, loss.clamp(min=stop)), loss_raw
 
 from pytti.LossAug.TVLoss import TVLoss
 from pytti.LossAug.MSELoss import MSELoss

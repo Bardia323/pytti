@@ -18,6 +18,14 @@ def break_tensor(tensor):
     fracs = tensor - floors
     return floors, ceils, rounds, fracs
 
+_LUMA = {}
+def luma_weights(like):
+    """[[[0.299, 0.587, 0.114]]] cached on the device (building it per call was a blocking copy)"""
+    key = (like.device, like.dtype)
+    if key not in _LUMA:
+        _LUMA[key] = torch.tensor([[[0.299, 0.587, 0.114]]], device=like.device, dtype=like.dtype)
+    return _LUMA[key]
+
 class _PalletLookup(torch.autograd.Function):
     """
     pallet[idx] with a fast backward. The default index backward sorts all H*W indices and then
@@ -84,7 +92,7 @@ class HdrLoss(nn.Module):
     def forward(self, input):
         if isinstance(input, PixelImage):
             pallet = input.sort_pallet()
-            magic_color = pallet.new_tensor([[[0.299, 0.587, 0.114]]])
+            magic_color = luma_weights(pallet)
             color_norms = torch.linalg.vector_norm(pallet * magic_color.sqrt(), dim=-1)
             loss_raw = F.mse_loss(color_norms, self.comp)
             return loss_raw * self.weight, loss_raw
@@ -184,7 +192,7 @@ class PixelImage(DifferentiableImage):
             return self.pallet_target
         pallet = (self.pallet / self.pallet_inertia).clamp(0, 1)
         # Calculate color norms for sorting
-        magic_color = pallet.new_tensor([[[0.299, 0.587, 0.114]]])
+        magic_color = luma_weights(pallet)
         color_norms = pallet.square().mul(magic_color).sum(dim=-1)
         # Optimized sorting using torch.gather
         pallet_indices = color_norms.argsort(dim=0)
