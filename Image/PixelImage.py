@@ -18,6 +18,30 @@ def break_tensor(tensor):
     fracs = tensor - floors
     return floors, ceils, rounds, fracs
 
+class _PalletLookup(torch.autograd.Function):
+    """
+    pallet[idx] with a fast backward. The default index backward sorts all H*W indices and then
+    reduces each palette entry's duplicates serially -- with ~2M pixels hitting a few dozen entries
+    that one kernel was ~70% of a training step. index_add_ does the same reduction in ~1-2ms.
+    """
+    @staticmethod
+    def forward(ctx, pallet, idx):
+        ctx.save_for_backward(idx)
+        ctx.pallet_shape = pallet.shape
+        return pallet[idx]
+
+    @staticmethod
+    def backward(ctx, grad):
+        idx, = ctx.saved_tensors
+        n_entries = ctx.pallet_shape[0]
+        grad = grad.reshape(idx.numel(), -1)
+        out = grad.new_zeros(n_entries, grad.shape[1])
+        out.index_add_(0, idx.reshape(-1), grad)
+        return out.view(ctx.pallet_shape), None
+
+def pallet_lookup(pallet, idx):
+    return _PalletLookup.apply(pallet, idx)
+
 class PalletLoss(nn.Module):
     def __init__(self, n_pallets, weight=0.15, device=DEVICE):
         super().__init__()
@@ -197,7 +221,7 @@ class PixelImage(DifferentiableImage):
         pallet_weights = F.softmax(pallet_weights, dim=2).unsqueeze(-1)
         pallets = pallets.unsqueeze(-1)
 
-        colors_disc = gamma_corrected_pallet[value_rounds]
+        colors_disc = pallet_lookup(gamma_corrected_pallet, value_rounds)
         colors_disc = (colors_disc * pallets).sum(dim=2)
         colors_disc = F.interpolate(
             colors_disc.permute(2, 0, 1).unsqueeze(0).contiguous(),
@@ -205,7 +229,7 @@ class PixelImage(DifferentiableImage):
             mode='nearest'
         )
 
-        colors_cont = gamma_corrected_pallet[value_floors] * (1 - value_fracs) + gamma_corrected_pallet[value_ceils] * value_fracs
+        colors_cont = pallet_lookup(gamma_corrected_pallet, value_floors) * (1 - value_fracs) + pallet_lookup(gamma_corrected_pallet, value_ceils) * value_fracs
         colors_cont = (colors_cont * pallet_weights).sum(dim=2)
         colors_cont = F.interpolate(
             colors_cont.permute(2, 0, 1).unsqueeze(0).contiguous(),
