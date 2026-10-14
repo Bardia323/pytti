@@ -95,7 +95,7 @@ class HDMultiClipEmbedder(nn.Module):
       input = F.pad(input,(paddingx, paddingx, paddingy, paddingy), mode = PADDING_MODES[self.border_mode])
     for cut_size, perceptor in zip(self.cut_sizes, perceptors):
       cutouts, offsets, sizes = self.make_cutouts(input, side_x, side_y, cut_size)
-      clip_in = normalize(cutouts)
+      clip_in = clip_normalize(perceptor, cutouts)
       image_embeds.append(perceptor.encode_image(clip_in).float().unsqueeze(0))
       all_offsets.append(offsets)
       all_sizes.append(sizes)

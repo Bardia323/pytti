@@ -5,6 +5,7 @@ import pandas as pd
 import math
 import inspect
 import torch
+import torch.nn.functional as F
 
 from labellines import labelLines
 from scipy.signal import savgol_filter
@@ -13,11 +14,45 @@ import matplotlib.pyplot as plt
 from pytti import format_input
 
 _ADAM_KERNEL = None
+_ADAM_KERNEL_BOUNDED = None
 
 def _adam_update(p, g, m, v, lr, bc1, bc2_sqrt, beta1: float, beta2: float, eps: float):
     m.lerp_(g, 1 - beta1)
     v.mul_(beta2).addcmul_(g, g, value=1 - beta2)
     p.sub_(lr / bc1 * m / (v.sqrt() / bc2_sqrt + eps))
+
+def _adam_update_bounded(p, g, m, v, lr, bc1, bc2_sqrt, beta1: float, beta2: float, eps: float):
+    # same, but no element moves more than lr in one step: a gradient spike far above the element's history (e.g. a
+    # small cutout landing on pixels used to the weak gradients of large ones) can't throw a patch into noise
+    m.lerp_(g, 1 - beta1)
+    v.mul_(beta2).addcmul_(g, g, value=1 - beta2)
+    p.sub_(lr * (m / bc1 / (v.sqrt() / bc2_sqrt + eps)).clamp(-1, 1))
+
+# Preconditioners for image parameters (opt-in; param group key "precond", set per step by cell 2.15):
+#  "pyramid": Adam on a Laplacian-pyramid view of the image. The gradient is pooled to each of up to 6 octaves, each
+#             octave keeps its own Adam moments, and the per-octave steps are upsampled and averaged. Coarse structure
+#             moves coherently and faint high-frequency gradient noise isn't blown up to a full-size step the way
+#             per-pixel Adam does it. The largest possible step is still lr.
+#  "block":   Adam with one second moment per 8x8 block (Adam-mini / Adafactor style), upsampled smoothly: a pixel's
+#             step is scaled by its neighbourhood's gradient history, not its own, so isolated spikes / quiet patches
+#             aren't equalised into noise.
+# Only for image-shaped parameters (last two dims >= 32) that don't opt out (PixelImage's palette-choice scores do);
+# anything else uses plain Adam.
+_PYR_MAX_LEVELS = 6
+_BLOCK = 8
+
+def _pyr_sizes(H, W):
+    sizes, k = [], 0
+    while k < _PYR_MAX_LEVELS and min(-(-H // 2 ** k), -(-W // 2 ** k)) >= 16:
+        sizes.append((-(-H // 2 ** k), -(-W // 2 ** k)))
+        k += 1
+    return sizes
+
+def _adam_dir(g, m, v, bc1: float, bc2_sqrt: float, beta1: float, beta2: float, eps: float, bounded: bool):
+    m.lerp_(g, 1 - beta1)
+    v.mul_(beta2).addcmul_(g, g, value=1 - beta2)
+    u = m / bc1 / (v.sqrt() / bc2_sqrt + eps)
+    return u.clamp(-1, 1) if bounded else u
 
 class FastAdam(optim.Optimizer):
     """torch.optim.Adam's update rule (no weight decay / amsgrad) as one compiled kernel per parameter:
@@ -26,9 +61,10 @@ class FastAdam(optim.Optimizer):
     scalars live in device tensors so nothing recompiles. Differences vs torch Adam are float rounding."""
     def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8):
         super().__init__(params, dict(lr=lr, betas=betas, eps=eps))
-        global _ADAM_KERNEL
+        global _ADAM_KERNEL, _ADAM_KERNEL_BOUNDED
         if _ADAM_KERNEL is None:
             _ADAM_KERNEL = torch.compile(_adam_update, dynamic=False)
+            _ADAM_KERNEL_BOUNDED = torch.compile(_adam_update_bounded, dynamic=False)
         dev = self.param_groups[0]["params"][0].device
         self._lr, self._bc1, self._bc2 = (torch.zeros((), device=dev) for _ in range(3))
 
@@ -41,6 +77,15 @@ class FastAdam(optim.Optimizer):
                 if p.grad is None:
                     continue
                 st = self.state[p]
+                mode = group.get("precond", "none")
+                if mode not in ("pyramid", "block") or p.dim() < 2 or min(p.shape[-2:]) < 32 \
+                        or not getattr(p, "_pytti_precond", True):
+                    mode = "none"
+                if st and st.get("mode", "none") != mode:
+                    st.clear()                                  # switched preconditioner: fresh moments
+                if mode != "none":
+                    self._precond_step(p, st, group, mode, b1, b2)
+                    continue
                 if not st:
                     st["step"] = 0
                     st["exp_avg"] = torch.zeros_like(p, memory_format=torch.preserve_format)
@@ -50,9 +95,44 @@ class FastAdam(optim.Optimizer):
                 self._lr.fill_(group["lr"])
                 self._bc1.fill_(1 - b1 ** t)
                 self._bc2.fill_(math.sqrt(1 - b2 ** t))
-                _ADAM_KERNEL(p, p.grad, st["exp_avg"], st["exp_avg_sq"], self._lr, self._bc1, self._bc2,
-                             float(b1), float(b2), float(group["eps"]))
+                kernel = _ADAM_KERNEL_BOUNDED if group.get("bounded") else _ADAM_KERNEL
+                kernel(p, p.grad, st["exp_avg"], st["exp_avg_sq"], self._lr, self._bc1, self._bc2,
+                       float(b1), float(b2), float(group["eps"]))
         return loss
+
+    def _precond_step(self, p, st, group, mode, b1, b2):
+        H, W = p.shape[-2:]
+        g = p.grad.reshape(-1, 1, H, W)
+        if not st:
+            st["mode"], st["step"] = mode, 0
+            if mode == "pyramid":
+                for k, (h, w) in enumerate(_pyr_sizes(H, W)):
+                    st[f"m{k}"] = g.new_zeros(g.shape[0], 1, h, w)
+                    st[f"v{k}"] = g.new_zeros(g.shape[0], 1, h, w)
+            else:
+                st["exp_avg"] = torch.zeros_like(p)
+                st["v_block"] = g.new_zeros(g.shape[0], 1, -(-H // _BLOCK), -(-W // _BLOCK))
+        st["step"] += 1
+        t = st["step"]
+        bc1, bc2 = 1 - b1 ** t, math.sqrt(1 - b2 ** t)
+        eps, bounded = float(group["eps"]), bool(group.get("bounded"))
+        if mode == "pyramid":
+            n = len(_pyr_sizes(H, W))
+            total = None
+            for k in range(n):
+                gk = g if k == 0 else F.avg_pool2d(g, 2 ** k, ceil_mode=True)
+                u = _adam_dir(gk, st[f"m{k}"], st[f"v{k}"], bc1, bc2, float(b1), float(b2), eps, bounded)
+                if k:
+                    u = F.interpolate(u, size=(H, W), mode="bilinear", align_corners=False)
+                total = u if total is None else total.add_(u)
+            p.sub_(total.view_as(p), alpha=group["lr"] / n)
+        else:
+            m, vb = st["exp_avg"], st["v_block"]
+            m.lerp_(p.grad, 1 - b1)
+            vb.mul_(b2).add_(F.avg_pool2d(g * g, _BLOCK, ceil_mode=True), alpha=1 - b2)
+            den = F.interpolate(vb.sqrt() / bc2, size=(H, W), mode="bilinear", align_corners=False)
+            u = m / bc1 / (den.view_as(p) + eps)
+            p.sub_(u.clamp(-1, 1) if bounded else u, alpha=group["lr"])
 
 def make_adam(params, cls=None, **kw):
     """FastAdam when every parameter is on the GPU and the options allow it, else torch's Adam/AdamW."""

@@ -97,7 +97,9 @@ class _ClipNormalize:
   builds both tensors from Python lists on every call -- a blocking host->device copy each."""
   mean = [0.48145466, 0.4578275, 0.40821073]
   std  = [0.26862954, 0.26130258, 0.27577711]
-  def __init__(self):
+  def __init__(self, mean=None, std=None):
+    if mean is not None:
+      self.mean, self.std = list(mean), list(std)
     self._cache = {}
   def __call__(self, x):
     key = (x.device, x.dtype)
@@ -109,6 +111,35 @@ class _ClipNormalize:
 
 normalize = _ClipNormalize()
 
+def clip_normalize(perceptor, x):
+  """input scaling for this perceptor (OpenAI CLIP's unless the model set `pytti_normalize`)"""
+  return getattr(perceptor, "pytti_normalize", normalize)(x)
+
+def clip_tokenize(perceptor, text):
+  """token ids for this perceptor (OpenAI CLIP's tokenizer unless the model set `pytti_tokenize`)"""
+  tok = getattr(perceptor, "pytti_tokenize", None)
+  if tok is None:
+    from CLIP import clip
+    return clip.tokenize(text)
+  return tok(text)
+
+def euler(pan=0.0, tilt=0.0, roll=0.0):
+  """3D camera rotation per frame from angles in degrees, as the [w, x, y, z] quaternion rotate_3d expects:
+  pan turns the camera right (+) / left (-), tilt looks up (+) / down (-), roll turns the picture clockwise (+)
+  on screen (checked against the 3D warp: pan +5 moves content left, tilt +5 down). Usable in motion
+  expressions, e.g. rotate_3d = euler(2*sin(t), 0, 0)."""
+  def q(axis, deg):
+    h = math.radians(deg) / 2
+    v = [0.0, 0.0, 0.0]; v[axis] = math.sin(h)
+    return [math.cos(h)] + v
+  def mul(a, b):
+    w1, x1, y1, z1 = a; w2, x2, y2, z2 = b
+    return [w1*w2 - x1*x2 - y1*y2 - z1*z2, w1*x2 + x1*w2 + y1*z2 - z1*y2,
+            w1*y2 - x1*z2 + y1*w2 + z1*x2, w1*z2 + x1*y2 - y1*x2 + z1*w2]
+  return mul(mul(q(1, _EULER_SIGN[0] * pan), q(0, _EULER_SIGN[1] * tilt)), q(2, _EULER_SIGN[2] * roll))
+
+_EULER_SIGN = (1.0, 1.0, 1.0)   # axis directions, checked against the 3D warp
+
 math_env = None
 global_t = 0
 eval_memo = {}
@@ -118,7 +149,7 @@ def parametric_eval(string, **vals):
     return eval_memo[string]
   if isinstance(string, str):
     if math_env is None:
-      math_env = {'abs':abs, 'max':max, 'min':min, 'pow':pow, 'round':round, '__builtins__': None}
+      math_env = {'abs':abs, 'max':max, 'min':min, 'pow':pow, 'round':round, 'euler':euler, '__builtins__': None}
       math_env.update({key: getattr(math, key) for key in dir(math) if '_' not in key})
     math_env.update(vals)
     math_env['t'] = global_t
@@ -254,6 +285,6 @@ def to_pil(tensor, image_shape = None):
 
 __all__  = ['DEVICE', 
             'named_rearrange', 'format_input', 'pad_tensor', 'cat_with_pad', 'format_module', 'to_pil',
-            'replace_grad', 'clamp_with_grad', 'clamp_grad', 'normalize', 
+            'replace_grad', 'clamp_with_grad', 'clamp_grad', 'normalize', 'clip_normalize', 'clip_tokenize',
             'fetch', 'parse', 'parametric_eval', 'set_t', 'vram_usage_mode', 
             'print_vram_usage', 'reset_vram_usage', 'freeze_vram_usage', 'vram_profiling']

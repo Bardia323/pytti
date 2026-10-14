@@ -118,7 +118,7 @@ def mask_image(path, inverted = False, device = DEVICE):
 @torch.no_grad()
 def mask_semantic(text, device = DEVICE):
   perceptors = pytti.Perceptor.CLIP_PERCEPTORS
-  embeds = cat_with_pad([p.encode_text(clip.tokenize(text).to(device)).float() for p in perceptors])
+  embeds = cat_with_pad([p.encode_text(clip_tokenize(p, text).to(device)).float() for p in perceptors])
   @torch.no_grad()
   def mask(pos, size, emb, thresh = 0.5):
     #that's right, it's ridiculous garbage!
@@ -150,7 +150,7 @@ def parse_prompt(embedder, prompt_string = "", pil_image=None, device = DEVICE):
     out = LocationAwareMCIP(*embedder(dummy), embedder, weight, stop, text, prompt_string, mask = mask)
   else:
     perceptors = pytti.Perceptor.CLIP_PERCEPTORS
-    embeds = cat_with_pad([p.encode_text(clip.tokenize(text).to(device)).float() for p in perceptors])
+    embeds = cat_with_pad([p.encode_text(clip_tokenize(p, text).to(device)).float() for p in perceptors])
     out = Prompt(embeds, weight, stop, text, prompt_string, mask = mask)
   if roto is not None:
     roto.target = out

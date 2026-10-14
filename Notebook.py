@@ -121,6 +121,112 @@ def save_batch(settings_list, path):
 
 CLIP_MODEL_NAMES = None
 
+# parameter key -> (open_clip architecture, pretrained tag, label)
+OPENCLIP_MODELS = {
+    "ConvNeXtLarge": ("convnext_large_d_320", "laion2b_s29b_b131k_ft_soup", "ConvNeXt-Large"),
+    "DFN_ViT_H": ("ViT-H-14-quickgelu", "dfn5b", "ViT-H-14 (DFN)"),
+    "MetaCLIP_ViT_B": ("ViT-B-16-quickgelu", "metaclip_400m", "ViT-B-16 (MetaCLIP 400M)"),
+    "MetaCLIP_ViT_B_fullcc": ("ViT-B-16-quickgelu", "metaclip_fullcc", "ViT-B-16 (MetaCLIP 2.5B)"),
+    "SigLIP2_ViT_B": ("ViT-B-16-SigLIP2-256", "webli", "ViT-B-16 SigLIP 2 (256px)"),
+    "PE_Core_B": ("PE-Core-B-16", "meta", "Perception Encoder Core B/16"),
+    "MobileCLIP2_S2": ("MobileCLIP2-S2", "dfndr2b", "MobileCLIP2-S2"),
+    "SigLIP2_ViT_B32": ("ViT-B-32-SigLIP2-256", "webli", "ViT-B-32 SigLIP 2 (256px)"),
+    "MobileCLIP2_S0": ("MobileCLIP2-S0", "dfndr2b", "MobileCLIP2-S0"),
+    # adversarially fine-tuned (FARE, eps 4/255) vision towers of LAION models: their pixel gradients are
+    # "perceptually aligned", so an image forms in fewer steps. Text towers are the originals.
+    "ViTB32_FARE4": ("hf-hub:chs20/FARE4-ViT-B-32-laion2B-s34B-b79K", None, "ViT-B/32 robust (FARE4)"),
+    "ViTB16_FARE4": ("hf-hub:chs20/FARE4-ViT-B-16-laion2B-s34B-b88K", None, "ViT-B/16 robust (FARE4)"),
+    "ConvNeXtB_FARE4": ("hf-hub:chs20/FARE4-convnext_base_w-laion2B-s13B-b82K-augreg", None, "ConvNeXt-B robust (FARE4)"),
+}
+_CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
+_CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
+
+def _siglip2_tokenizer(repo, context_length):
+    """SigLIP 2's Gemma tokenizer.json is in the newer `tokenizers` format (BPE merges as pairs), which
+    the tokenizers version transformers 4.40 needs can't read. Convert it once (merges -> "a b" strings;
+    verified to give identical ids) into clip_tokenizers/<arch> and load that."""
+    import json, os, shutil
+    from huggingface_hub import hf_hub_download
+    from open_clip.tokenizer import HFTokenizer
+    out = os.path.join("clip_tokenizers", repo.split("/")[-1])
+    if not os.path.isfile(os.path.join(out, "tokenizer.json")):
+        os.makedirs(out, exist_ok=True)
+        for f in ("tokenizer_config.json", "special_tokens_map.json"):
+            shutil.copy(hf_hub_download(repo, f), os.path.join(out, f))
+        d = json.load(open(hf_hub_download(repo, "tokenizer.json"), encoding="utf-8"))
+        m = d["model"]
+        m["merges"] = [" ".join(x) if isinstance(x, list) else x for x in m["merges"]]
+        m.pop("ignore_merges", None)
+        json.dump(d, open(os.path.join(out, "tokenizer.json"), "w", encoding="utf-8"), ensure_ascii=False)
+    return HFTokenizer(out, context_length=context_length, clean="canonicalize")
+
+def _as_openai_vit(visual):
+    """open_clip's plain ViT image tower rebuilt as OpenAI CLIP's VisionTransformer (same weights, same maths:
+    identical fp32 output). torch.compile makes OpenAI's version much faster (ViT-B/16: 21 vs 30 ms per
+    20-cutout step). Returns None when the tower has anything OpenAI's lacks (attention pooling, layer scale,
+    other pooling, a different activation)."""
+    import torch.nn as nn
+    from open_clip.transformer import VisionTransformer, QuickGELU
+    from CLIP.clip.model import VisionTransformer as OpenAIViT
+    v = visual
+    if type(v) is not VisionTransformer or v.attn_pool is not None or v.pool_type != "tok" \
+            or getattr(v, "final_ln_after_pool", False) or not isinstance(v.patch_dropout, nn.Identity) \
+            or v.proj is None or v.conv1.bias is not None:
+        return None
+    blocks = v.transformer.resblocks
+    act = blocks[0].mlp.gelu
+    if any(not isinstance(b.ls_1, nn.Identity) or not isinstance(b.ls_2, nn.Identity) or hasattr(b, "ln_1_kv")
+           or type(b.mlp.gelu) is not type(act) for b in blocks):
+        return None
+    if isinstance(act, nn.GELU) and act.approximate == "none":
+        new_act = nn.GELU
+    elif isinstance(act, QuickGELU):
+        new_act = None                             # OpenAI's blocks already use QuickGELU
+    else:
+        return None
+    res = v.image_size[0] if isinstance(v.image_size, (tuple, list)) else v.image_size
+    ov = OpenAIViT(res, v.conv1.kernel_size[0], v.conv1.out_channels, len(blocks), blocks[0].attn.num_heads,
+                   v.proj.shape[1])
+    if new_act is not None:
+        for b in ov.transformer.resblocks:
+            b.mlp.gelu = new_act()
+    try:
+        ov.load_state_dict(v.state_dict(), strict=True)
+    except RuntimeError:
+        return None
+    p = next(v.parameters())
+    return ov.to(device=p.device, dtype=p.dtype).eval().requires_grad_(False)
+
+def load_openclip(arch, tag, device):
+    """An OpenCLIP model set up the way pytti uses CLIP: frozen, eval mode, `visual.input_resolution`,
+    plus `pytti_normalize` / `pytti_tokenize` when its input scaling or tokenizer differ from OpenAI CLIP's."""
+    import open_clip
+    from pytti import _ClipNormalize
+    model, _, _ = open_clip.create_model_and_transforms(arch, pretrained=tag, device=device)
+    if "MobileCLIP" in arch:                       # fold the training-time branches (MobileOne / FastViT)
+        from timm.utils.model import reparameterize_model
+        model = reparameterize_model(model)
+    model = model.eval().requires_grad_(False)     # weights are never trained: skip their gradients
+    ov = _as_openai_vit(model.visual)
+    if ov is not None:
+        model.visual = ov
+    if "PE-Core" in arch:                          # torch.compile (torch 2.2) gets its rotary-attention backward wrong
+        model.pytti_no_compile = True
+    if not hasattr(model.visual, 'input_resolution'):
+        res = getattr(model.visual, 'image_size', 224)
+        model.visual.input_resolution = res[0] if isinstance(res, (tuple, list)) else res
+    cfg = getattr(model.visual, "preprocess_cfg", {}) or {}
+    mean, std = tuple(cfg.get("mean", _CLIP_MEAN)), tuple(cfg.get("std", _CLIP_STD))
+    if mean != _CLIP_MEAN or std != _CLIP_STD:
+        model.pytti_normalize = _ClipNormalize(mean, std)
+    tcfg = (open_clip.get_model_config(arch) or {}).get("text_cfg", {})    # None for hf-hub: models
+    if "SigLIP2" in arch:
+        model.pytti_tokenize = _siglip2_tokenizer(tcfg.get("hf_tokenizer_name") or "timm/" + arch,
+                                                  tcfg.get("context_length", 64))
+    elif tcfg.get("hf_tokenizer_name") or tcfg.get("context_length", 77) != 77:
+        model.pytti_tokenize = open_clip.get_tokenizer(arch)
+    return model
+
 def load_clip(params):
     from pytti import Perceptor
     import torch 
@@ -141,15 +247,10 @@ def load_clip(params):
     if params.RN50:    CLIP_MODEL_NAMES.append("RN50")
     if params.ViTB32:  CLIP_MODEL_NAMES.append("ViT-B/32")
     if params.ViTB16:  CLIP_MODEL_NAMES.append("ViT-B/16")
-    if params.ConvNeXtLarge: CLIP_MODEL_NAMES.append("ConvNeXtLarge")
-    if params.DFN_ViT_H: CLIP_MODEL_NAMES.append("DFN_ViT_H")
-    if params.MetaCLIP_ViT_B: CLIP_MODEL_NAMES.append("MetaCLIP_ViT_B")
-    # ------------------------------------------------------
-    # PART 2: Check for Custom Models & Safety
-    # ------------------------------------------------------
-    # Check if any custom OpenCLIP models are in the list
-    custom_models = {"ConvNeXtLarge", "DFN_ViT_H", "MetaCLIP_ViT_B"}
-    custom_models_selected = bool(set(CLIP_MODEL_NAMES) & custom_models)
+    # OpenCLIP models, loaded after the OpenAI ones in this order (cell 2.15 relies on it)
+    for key in OPENCLIP_MODELS:
+        if getattr(params, key, False):
+            CLIP_MODEL_NAMES.append(key)
 
     if CLIP_MODEL_NAMES == []:
         Perceptor.free_clip()
@@ -157,68 +258,20 @@ def load_clip(params):
 
     Perceptor.free_clip()
     print("Loading CLIP...")
-    
-    # Separate standard and custom models
-    custom_models = {"ConvNeXtLarge", "DFN_ViT_H", "MetaCLIP_ViT_B"}
-    standard_models = [m for m in CLIP_MODEL_NAMES if m not in custom_models]
-    
-    # Initialize standard OpenAI models (if any are selected)
+
+    standard_models = [m for m in CLIP_MODEL_NAMES if m not in OPENCLIP_MODELS]
     if standard_models:
         Perceptor.init_clip(standard_models)
     else:
-        # Safety: Ensure the list exists if we skipped standard init
         Perceptor.CLIP_PERCEPTORS = []
-    
-    # ------------------------------------------------------
-    # PART 3: Inject OpenCLIP Models (With Patch)
-    # ------------------------------------------------------
-    
-    if torch.cuda.is_available():
-        device = torch.device('cuda')
-    else:
-        device = torch.device('cpu')
 
-    # Helper function to fix the "input_resolution" crash
-    def patch_model_for_pytti(model):
-        if not hasattr(model.visual, 'input_resolution'):
-            # OpenCLIP uses 'image_size', Pytti expects 'input_resolution'
-            # We map one to the other manually.
-            if hasattr(model.visual, 'image_size'):
-                res = model.visual.image_size
-                # If it's a tuple (224, 224), take the first number
-                if isinstance(res, tuple): res = res[0]
-                model.visual.input_resolution = res
-        return model
-    
-    # 1. ConvNeXt-Large
-    if "ConvNeXtLarge" in CLIP_MODEL_NAMES:
-        print("Loading OpenCLIP: ConvNeXt-Large...")
-        model, _, _ = open_clip.create_model_and_transforms(
-            "convnext_large_d_320", 
-            pretrained="laion2b_s29b_b131k_ft_soup", 
-            device=device
-        )
-        Perceptor.CLIP_PERCEPTORS.append(patch_model_for_pytti(model))
-
-    # 2. DFN ViT-H-14
-    if "DFN_ViT_H" in CLIP_MODEL_NAMES:
-        print("Loading OpenCLIP: ViT-H-14 (DFN)...")
-        model, _, _ = open_clip.create_model_and_transforms(
-            "ViT-H-14-quickgelu", 
-            pretrained="dfn5b", 
-            device=device
-        )
-        Perceptor.CLIP_PERCEPTORS.append(patch_model_for_pytti(model))
-
-    # 3. MetaCLIP ViT-B-16
-    if "MetaCLIP_ViT_B" in CLIP_MODEL_NAMES:
-        print("Loading OpenCLIP: ViT-B-16 (MetaCLIP)...")
-        model, _, _ = open_clip.create_model_and_transforms(
-            "ViT-B-16-quickgelu", 
-            pretrained="metaclip_400m", 
-            device=device
-        )
-        Perceptor.CLIP_PERCEPTORS.append(patch_model_for_pytti(model))
+    device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+    for key, (arch, tag, label) in OPENCLIP_MODELS.items():
+        if key in CLIP_MODEL_NAMES:
+            print(f"Loading OpenCLIP: {label}...")
+            Perceptor.CLIP_PERCEPTORS.append(Perceptor.cached_perceptor(
+                key, lambda arch=arch, tag=tag: load_openclip(arch, tag, device)))
+    Perceptor.park_unused(Perceptor.CLIP_PERCEPTORS)
 
     print("CLIP loaded.")
 
